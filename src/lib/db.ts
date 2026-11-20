@@ -32,6 +32,9 @@ export interface InventoryItem {
   serializable?: boolean;
   // NEW: FEFO/FIFO control
   fefoPriority?: number; // higher = ship first
+  // Source of the stock figure: 'seed' = demo/synthetic seed data (unverified),
+  // 'inbound' = received against a PO, 'count' = cycle count, 'adjustment' = manual.
+  stockSource?: 'seed' | 'inbound' | 'count' | 'adjustment';
 }
 
 export interface Order {
@@ -909,6 +912,11 @@ export async function seedDatabase() {
 
   const invCount = await db.inventory.count();
   if (invCount === 0) {
+    // NOTE: Seeded stock figures are SYNTHETIC/demo data. They are derived from
+    // the Ozon wave posting quantities (qty * 3, min 8) and are NOT a verified
+    // stock source. They are marked stockSource = 'seed' so downstream
+    // allocation/fulfillment logic can treat them as unverified operational
+    // inventory until replaced by real inbound/cycle-count figures.
     const wave = waveData;
     const locationFor = (product: string) => {
       const p = product.toLowerCase();
@@ -936,6 +944,7 @@ export async function seedDatabase() {
         serializable: true,
         reorderPoint: 4,
         reorderQty: 10,
+        stockSource: 'seed', // synthetic demo stock — not a verified source
         updatedAt: now,
       })),
     );
