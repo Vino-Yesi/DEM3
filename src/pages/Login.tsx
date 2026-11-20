@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useAuth } from '@/lib/auth';
+import { createInitialAdmin, useAuth } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { PASSWORD_MIN_LENGTH } from '@/lib/passwords';
 import { Eye, EyeOff, Hexagon, Sparkles, Shield, Zap, Package } from 'lucide-react';
 import { Navigate, useNavigate } from 'react-router-dom';
 
@@ -97,9 +99,26 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
   const [focusField, setFocusField] = useState<'user' | 'pass' | null>(null);
+  const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void db.users.count().then((count) => {
+      if (active) setSetupRequired(count === 0);
+    }).catch(() => {
+      if (active) {
+        setError('Could not open the local user database. Refresh the app and try again.');
+        setSetupRequired(false);
+      }
+    });
+    return () => { active = false; };
+  }, []);
 
   if (user) {
     return <Navigate to="/" replace />;
+  }
+  if (setupRequired === null) {
+    return <div className="min-h-[100dvh] bg-black flex items-center justify-center text-sm text-white/60">Checking local workspace…</div>;
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -107,6 +126,10 @@ export default function Login() {
     setError('');
     setLoading(true);
     try {
+      if (setupRequired) {
+        await createInitialAdmin(username, password, username);
+        setSetupRequired(false);
+      }
       const success = await login(username.trim(), password);
       if (!success) {
         setError('Invalid credentials. Check username and password.');
@@ -115,8 +138,8 @@ export default function Login() {
       } else {
         navigate('/', { replace: true });
       }
-    } catch {
-      setError('Login failed. Please try again.');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Login failed. Please try again.');
       setShake(true);
       setTimeout(() => setShake(false), 500);
     } finally {
@@ -231,10 +254,10 @@ export default function Login() {
                     <Hexagon className="w-7 h-7 text-white drop-shadow" strokeWidth={2.25} />
                   </div>
                 </motion.div>
-                <h1 className="text-xl font-semibold tracking-tight">Yesi-WMS Lite</h1>
-                <p className="text-xs text-white/40 mt-1 flex items-center gap-1.5">
-                  <Sparkles className="w-3 h-3 text-sky-400/80" />
-                  Sign in to your warehouse floor
+                <h1 className="text-xl font-semibold tracking-tight">{setupRequired ? 'Set up your administrator' : 'Yesi-WMS Lite'}</h1>
+                <p className="text-xs text-white/40 mt-1 flex items-center gap-1.5 text-center">
+                  <Sparkles className="w-3 h-3 text-sky-400/80 shrink-0" />
+                  {setupRequired ? 'Create the first account for this device. No default password is installed.' : 'Sign in to your warehouse floor'}
                 </p>
               </div>
 
@@ -263,7 +286,7 @@ export default function Login() {
 
                 <div>
                   <label className="text-[10px] uppercase tracking-[0.18em] text-white/35 font-medium ml-0.5">
-                    Password
+                    {setupRequired ? 'Administrator password' : 'Password'}
                   </label>
                   <div
                     className={`mt-1.5 relative rounded-xl transition-all duration-300 ${
@@ -272,12 +295,13 @@ export default function Login() {
                   >
                     <input
                       type={showPassword ? 'text' : 'password'}
-                      autoComplete="current-password"
+                      autoComplete={setupRequired ? 'new-password' : 'current-password'}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       onFocus={() => setFocusField('pass')}
                       onBlur={() => setFocusField(null)}
-                      placeholder="••••••••"
+                      minLength={setupRequired ? PASSWORD_MIN_LENGTH : undefined}
+                      placeholder={setupRequired ? `At least ${PASSWORD_MIN_LENGTH} characters` : '••••••••'}
                       className="w-full rounded-xl bg-white/[0.04] border border-white/[0.08] px-4 py-3 pr-11 text-sm text-white placeholder:text-white/25 focus:outline-none focus:border-sky-400/40 transition-colors"
                     />
                     <button
@@ -289,6 +313,7 @@ export default function Login() {
                       {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
+                  {setupRequired && <p className="mt-1.5 text-[10px] text-white/40">Choose 12+ characters. You can use a long passphrase.</p>}
                 </div>
 
                 <AnimatePresence>
@@ -327,10 +352,10 @@ export default function Login() {
                     {loading ? (
                       <>
                         <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                        Authenticating…
+                        {setupRequired ? 'Creating secure admin…' : 'Authenticating…'}
                       </>
                     ) : (
-                      'Sign in'
+                      setupRequired ? 'Create admin account' : 'Sign in'
                     )}
                   </span>
                 </motion.button>

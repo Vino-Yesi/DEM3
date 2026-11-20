@@ -32,6 +32,30 @@ function daysUntilExpiry(expiryDate?: string): number | null {
   return Math.ceil(diff / (1000 * 60 * 60 * 24));
 }
 
+async function updateStockWithoutBreakingReservations(id: number, newStock: number) {
+  return db.transaction('rw', db.inventory, db.inventoryReservations, async () => {
+    const item = await db.inventory.get(id);
+    if (!item) return { updated: false, message: 'Inventory item no longer exists. Refresh and try again.' };
+    const [sameSkuItems, reservations] = await Promise.all([
+      db.inventory.where('sku').equals(item.sku).toArray(),
+      db.inventoryReservations.where('sku').equals(item.sku).toArray(),
+    ]);
+    const reserved = reservations
+      .filter((reservation) => reservation.status === 'reserved' || reservation.status === 'allocated')
+      .reduce((total, reservation) => total + reservation.quantity, 0);
+    const currentSkuStock = sameSkuItems.reduce((total, sibling) => total + (sibling.stock || 0), 0);
+    const nextSkuStock = currentSkuStock - (item.stock || 0) + newStock;
+    if (nextSkuStock < reserved) {
+      return {
+        updated: false,
+        message: `Stock cannot be reduced below ${reserved} unit(s) reserved for active orders.`,
+      };
+    }
+    await db.inventory.update(id, { stock: newStock, updatedAt: new Date().toISOString() });
+    return { updated: true, message: '' };
+  });
+}
+
 export default function InventoryHub() {
   const { user } = useAuth();
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -52,6 +76,7 @@ export default function InventoryHub() {
   const [activeTab, setActiveTab] = useState<'all' | 'traceability' | 'expiry'>('all');
   const [showScanner, setShowScanner] = useState(false);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
+  const [inventoryMessage, setInventoryMessage] = useState<string | null>(null);
   const [lotInboundRecords, setLotInboundRecords] = useState<InboundRecord[]>([]);
 
   const loadInventory = useCallback(async () => {
@@ -65,6 +90,8 @@ export default function InventoryHub() {
   }, []);
 
   useEffect(() => {
+    // Initial Dexie reads synchronize component state with external persisted records.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadInventory();
     loadMovements();
   }, [loadInventory, loadMovements]);
@@ -72,6 +99,7 @@ export default function InventoryHub() {
   // AnomalySentinel + Oracle when inventory changes
   useEffect(() => {
     if (!inventory.length) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setAnomalyAlerts([]);
       setOraclePreview(null);
       return;
@@ -163,28 +191,48 @@ export default function InventoryHub() {
   const lowStockCount = inventory.filter(isLowStock).length;
 
   const handleStockUpdate = async (id: number) => {
-    const newStock = parseInt(editStock);
-    if (isNaN(newStock) || newStock < 0) return;
-    await db.inventory.update(id, { stock: newStock, updatedAt: new Date().toISOString() });
+    const newStock = Number.parseInt(editStock, 10);
+    if (!Number.isSafeInteger(newStock) || newStock < 0) {
+      setInventoryMessage('Enter a whole-number stock quantity of zero or more.');
+      setEditingId(null);
+      return;
+    }
+    const result = await updateStockWithoutBreakingReservations(id, newStock);
+    setInventoryMessage(result.updated ? null : result.message);
     setEditingId(null);
-    loadInventory();
+    if (result.updated) await loadInventory();
   };
 
   const handleAdjustment = async () => {
     if (!adjustItem || !adjustQty) return;
-    const delta = parseInt(adjustQty);
-    if (isNaN(delta)) return;
-    const newStock = Math.max(0, (adjustItem.stock || 0) + delta);
-    await db.inventory.update(adjustItem.id!, { stock: newStock, updatedAt: new Date().toISOString() });
-    await logInventoryMovement(adjustItem.sku, 'adjustment', Math.abs(delta), user?.displayName || 'Unknown', {
-      note: `${delta > 0 ? '+' : ''}${delta} | ${adjustReason || 'Manual adjustment'}`,
+    const delta = Number.parseInt(adjustQty, 10);
+    if (!Number.isSafeInteger(delta)) {
+      setInventoryMessage('Enter a whole-number adjustment quantity.');
+      return;
+    }
+    const latestItem = adjustItem.id === undefined ? adjustItem : await db.inventory.get(adjustItem.id);
+    if (!latestItem || latestItem.id === undefined) {
+      setInventoryMessage('Inventory item no longer exists. Refresh and try again.');
+      return;
+    }
+    const currentStock = latestItem.stock || 0;
+    const newStock = Math.max(0, currentStock + delta);
+    const actualDelta = newStock - currentStock;
+    const result = await updateStockWithoutBreakingReservations(latestItem.id, newStock);
+    if (!result.updated) {
+      setInventoryMessage(result.message);
+      return;
+    }
+    setInventoryMessage(null);
+    await logInventoryMovement(latestItem.sku, 'adjustment', Math.abs(actualDelta), user?.displayName || 'Unknown', {
+      note: `${actualDelta > 0 ? '+' : ''}${actualDelta} | ${adjustReason || 'Manual adjustment'}`,
     });
-    await logAction('INVENTORY_ADJUST', `Adjusted ${adjustItem.sku} by ${delta}: ${adjustReason}`, user?.displayName || 'Unknown');
+    await logAction('INVENTORY_ADJUST', `Adjusted ${latestItem.sku} by ${actualDelta}: ${adjustReason}`, user?.displayName || 'Unknown');
     setAdjustItem(null);
     setAdjustQty('');
     setAdjustReason('');
-    loadInventory();
-    loadMovements();
+    await loadInventory();
+    await loadMovements();
   };
 
   const getLocationZone = (location: string) => location.split('-')[0] || location;
@@ -230,6 +278,8 @@ export default function InventoryHub() {
 
   useEffect(() => {
     if (detailItem) {
+      // Dexie lookup synchronizes the selected item detail panel.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       loadInboundForLot(detailItem.lotNumber);
     } else {
       setLotInboundRecords([]);
@@ -418,6 +468,12 @@ export default function InventoryHub() {
           <Barcode className="w-3.5 h-3.5 text-accent-sky" />
           <span className="text-xs text-text-primary">{scanMessage}</span>
         </motion.div>
+      )}
+      {inventoryMessage && (
+        <div role="alert" className="mb-4 flex items-start gap-2 rounded-md border border-accent-yellow/20 bg-accent-yellow/10 p-3 text-xs text-accent-yellow">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{inventoryMessage}</span>
+        </div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">

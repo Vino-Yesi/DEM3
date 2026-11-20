@@ -35,6 +35,8 @@ export default function PickPack() {
   }, []);
 
   useEffect(() => {
+    // Initial Dexie reads synchronize the pick workflow with persisted orders and inventory.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
   }, [loadData]);
 
@@ -142,8 +144,11 @@ export default function PickPack() {
       return;
     }
 
-    // Update order status
-    await db.orders.update(selectedOrder.id!, { status: 'Shipped', updatedAt: new Date().toISOString(), assignedTo: user?.displayName || 'Unknown' });
+    // Marketplace orders must remain locally Packed until their provider-specific
+    // dispatch transition is confirmed in Marketplace Exchange.
+    const isMarketplaceOrder = Boolean(selectedOrder.sourceMarketplace);
+    const nextStatus = isMarketplaceOrder ? 'Packed' : 'Shipped';
+    await db.orders.update(selectedOrder.id!, { status: nextStatus, updatedAt: new Date().toISOString(), assignedTo: user?.displayName || 'Unknown' });
 
     // Deduct inventory for each picked quantity
     for (const req of requiredItems) {
@@ -162,9 +167,18 @@ export default function PickPack() {
       }
     }
 
-    await logAction('ORDER_SHIPPED', `Order ${selectedOrder.orderId} verified and shipped (${requiredItems.map(r => `${r.picked}x ${r.sku}`).join(', ')})`, user?.displayName || 'Unknown');
+    await logAction(
+      isMarketplaceOrder ? 'ORDER_PACKED_FOR_MARKETPLACE' : 'ORDER_SHIPPED',
+      `Order ${selectedOrder.orderId} verified and ${isMarketplaceOrder ? 'packed for provider dispatch' : 'shipped'} (${requiredItems.map(r => `${r.picked}x ${r.sku}`).join(', ')})`,
+      user?.displayName || 'Unknown',
+    );
 
-    setMessage({ type: 'success', text: `Order ${selectedOrder.orderId} verified and shipped!` });
+    setMessage({
+      type: 'success',
+      text: isMarketplaceOrder
+        ? `Order ${selectedOrder.orderId} packed. Confirm marketplace dispatch and any handoff in Marketplace Exchange.`
+        : `Order ${selectedOrder.orderId} verified and shipped!`,
+    });
     setSelectedOrder(null);
     setRequiredItems([]);
     loadData();
@@ -195,7 +209,12 @@ export default function PickPack() {
       const items = getRequiredItems(order);
       const allPicked = items.every(req => (wavePicks[req.sku] || 0) >= req.quantity);
       if (allPicked) {
-        await db.orders.update(order.id!, { status: 'Shipped', updatedAt: new Date().toISOString(), assignedTo: user?.displayName || 'Unknown' });
+        const isMarketplaceOrder = Boolean(order.sourceMarketplace);
+        await db.orders.update(order.id!, {
+          status: isMarketplaceOrder ? 'Packed' : 'Shipped',
+          updatedAt: new Date().toISOString(),
+          assignedTo: user?.displayName || 'Unknown',
+        });
         for (const req of items) {
           const item = await db.inventory.where({ sku: req.sku }).first();
           if (item && item.id) {
@@ -211,14 +230,26 @@ export default function PickPack() {
             });
           }
         }
-        await logAction('WAVE_SHIPPED', `Order ${order.orderId} shipped via wave`, user?.displayName || 'Unknown');
+        await logAction(
+          order.sourceMarketplace ? 'WAVE_ORDER_PACKED_FOR_MARKETPLACE' : 'WAVE_SHIPPED',
+          order.sourceMarketplace
+            ? `Order ${order.orderId} packed via wave; provider dispatch is pending`
+            : `Order ${order.orderId} shipped via wave`,
+          user?.displayName || 'Unknown',
+        );
       }
     }
     setWaveOrders([]);
     setWavePicks({});
     setPickMode('standard');
     loadData();
-    setMessage({ type: 'success', text: 'Wave completed and orders shipped!' });
+    const marketplaceCount = waveOrders.filter((order) => Boolean(order.sourceMarketplace)).length;
+    setMessage({
+      type: 'success',
+      text: marketplaceCount > 0
+        ? `Wave completed. Marketplace order(s) are packed; finish their provider dispatch in Marketplace Exchange.`
+        : 'Wave completed and orders shipped!',
+    });
   };
 
   const sortedRequiredItems = (items: RequiredItem[]) => {
@@ -251,7 +282,7 @@ export default function PickPack() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-text-primary">Pick & Pack</h1>
-            <p className="text-sm text-text-secondary mt-1">Fulfillment: scan, verify, and ship orders</p>
+            <p className="text-sm text-text-secondary mt-1">Fulfillment: scan and verify; marketplace dispatch is confirmed separately</p>
           </div>
           <div className="flex gap-2">
             {pickMode === 'standard' ? (
@@ -483,7 +514,7 @@ export default function PickPack() {
                   className="w-full flex items-center justify-center gap-2 py-3 bg-accent-sky text-void font-semibold text-sm rounded-md hover:bg-accent-sky/90 transition-colors disabled:opacity-30 disabled:cursor-not-allowed active:translate-y-[1px]"
                 >
                   <CheckCircle className="w-4 h-4" />
-                  Verify & Ship
+                  {selectedOrder?.sourceMarketplace ? 'Verify & Pack' : 'Verify & Ship'}
                 </motion.button>
               </>
             )}

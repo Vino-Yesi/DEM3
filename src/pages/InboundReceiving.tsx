@@ -4,7 +4,7 @@ import { db, logAction, logInventoryMovement } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
 import BarcodeReader from '@/components/BarcodeReader';
 import { Package, Plus, History, ArrowRight, AlertTriangle, ShieldCheck, FileSpreadsheet, Upload, CheckCircle, ClipboardList, Sheet } from 'lucide-react';
-import * as XLSX from 'xlsx';
+import * as XLSX from '@e965/xlsx';
 import type { InboundRecord, PurchaseOrder } from '@/lib/db';
 
 type ReceivingTab = 'manual' | 'excel' | 'po';

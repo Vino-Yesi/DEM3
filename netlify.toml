@@ -1,3 +1,18 @@
 [build]
   command = "npm run build"
   publish = "dist"
+
+[functions]
+  node_bundler = "esbuild"
+
+# Proxy the same-origin client endpoint to the private serverless adapter.
+[[redirects]]
+  from = "/api/marketplace"
+  to = "/.netlify/functions/marketplace"
+  status = 200
+
+# Let React Router serve direct links and refreshes on every client-side route.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

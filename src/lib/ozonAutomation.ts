@@ -10,6 +10,8 @@ export async function runAutomationChecks(operator: string): Promise<string[]> {
 
   const configs = await db.sheetSyncConfigs.where('autoSync').equals(1).toArray();
   for (const config of configs) {
+    // API-key credentials are never saved, so API-only configs cannot auto-sync.
+    if (config.fetchMethod === 'api') continue;
     const lastSync = config.lastSync ? new Date(config.lastSync).getTime() : 0;
     const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
     if (Date.now() - lastSync >= intervalMs) {

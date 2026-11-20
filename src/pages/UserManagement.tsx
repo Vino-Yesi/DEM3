@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
+import { hashPassword, PASSWORD_MIN_LENGTH } from '@/lib/passwords';
 import {
   Users, Plus, Shield, User, Trash2, X, UserCog, ScrollText, Clock, Pencil, KeyRound, Check,
 } from 'lucide-react';
@@ -49,16 +50,21 @@ export default function UserManagement() {
   }, [message]);
 
   const handleAddUser = async () => {
-    if (!newUser.username.trim() || !newUser.password.trim()) {
+    const username = newUser.username.trim();
+    if (!username || !newUser.password) {
       setMessage({ type: 'error', text: 'Username and password are required' });
       return;
     }
-    if (newUser.password.trim().length < 4) {
-      setMessage({ type: 'error', text: 'Password must be at least 4 characters' });
+    if (!/^[A-Za-z0-9._-]{3,32}$/.test(username)) {
+      setMessage({ type: 'error', text: 'Use a username with 3–32 letters, numbers, dots, underscores or hyphens' });
+      return;
+    }
+    if (newUser.password.length < PASSWORD_MIN_LENGTH) {
+      setMessage({ type: 'error', text: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });
       return;
     }
 
-    const existing = await db.users.where({ username: newUser.username.trim() }).first();
+    const existing = (await db.users.toArray()).find((item) => item.username.toLowerCase() === username.toLowerCase());
     if (existing) {
       setMessage({ type: 'error', text: 'Username already exists' });
       return;
@@ -66,10 +72,10 @@ export default function UserManagement() {
 
     try {
       await db.users.add({
-        username: newUser.username.trim(),
-        password: newUser.password,
+        username,
+        password: await hashPassword(newUser.password),
         role: newUser.role,
-        displayName: newUser.displayName.trim() || newUser.username.trim(),
+        displayName: newUser.displayName.trim() || username,
         createdAt: new Date().toISOString(),
       });
       await logAction(
@@ -108,11 +114,12 @@ export default function UserManagement() {
       role: editForm.role,
     };
     if (editForm.password.trim()) {
-      if (editForm.password.trim().length < 4) {
-        setMessage({ type: 'error', text: 'Password must be at least 4 characters' });
+      if (editForm.password.length < PASSWORD_MIN_LENGTH) {
+        setMessage({ type: 'error', text: `Password must be at least ${PASSWORD_MIN_LENGTH} characters` });
         return;
       }
-      updates.password = editForm.password.trim();
+      updates.password = await hashPassword(editForm.password);
+      updates.mustChangePassword = true;
     }
 
     // Prevent locking yourself out of admin
@@ -143,8 +150,10 @@ export default function UserManagement() {
 
   const handleDeleteUser = async (id: number | undefined, username: string) => {
     if (!id) return;
-    if (username === 'admin') {
-      setMessage({ type: 'error', text: 'Cannot delete the default admin account' });
+    const target = users.find((user) => user.id === id);
+    const remainingAdmins = users.filter((user) => user.role === 'admin' && user.id !== id).length;
+    if (target?.role === 'admin' && remainingAdmins === 0) {
+      setMessage({ type: 'error', text: 'Keep at least one administrator account.' });
       return;
     }
     if (username === currentUser?.username) {
@@ -354,6 +363,7 @@ export default function UserManagement() {
                             <div>
                               <div className="font-medium text-white">{u.displayName}</div>
                               <div className="font-mono text-[10px] text-text-secondary">@{u.username}</div>
+                              {u.mustChangePassword && <span className="mt-1 inline-flex rounded bg-accent-yellow/10 px-1.5 py-0.5 text-[9px] text-accent-yellow">Password change required</span>}
                             </div>
                           </div>
                           {editingId === u.id && (

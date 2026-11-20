@@ -21,22 +21,35 @@ export interface SheetFetchOptions {
   range?: string;
 }
 
-export function parseSheetUrl(url: string): { spreadsheetId: string; gid: string } | null {
-  const idMatch = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-  if (!idMatch) return null;
-  const gidMatch = url.match(/[?&#]gid=(\d+)/);
-  return {
-    spreadsheetId: idMatch[1],
-    gid: gidMatch?.[1] || '0',
-  };
+export function parseSheetUrl(value: string): { spreadsheetId: string; gid: string } | null {
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:' || url.hostname !== 'docs.google.com' || url.username || url.password) return null;
+    if ([...url.searchParams.keys()].some((key) => /key|token|secret|password|auth/i.test(key))) return null;
+    const idMatch = url.pathname.match(/^\/spreadsheets\/d\/([A-Za-z0-9_-]{10,200})(?:\/|$)/);
+    if (!idMatch) return null;
+    const gidMatch = url.searchParams.get('gid') || url.hash.match(/(?:^#|[&#])gid=(\d+)/)?.[1];
+    return { spreadsheetId: idMatch[1], gid: gidMatch && /^\d{1,20}$/.test(gidMatch) ? gidMatch : '0' };
+  } catch {
+    return null;
+  }
+}
+
+function validateSheetId(spreadsheetId: string, gid?: string): void {
+  if (!/^[A-Za-z0-9_-]{10,200}$/.test(spreadsheetId)) throw new Error('Enter a valid Google Sheets spreadsheet ID.');
+  if (gid && !/^\d{1,20}$/.test(gid)) throw new Error('The sheet tab ID (gid) must contain digits only.');
 }
 
 function buildGvizCsvUrl(spreadsheetId: string, gid: string): string {
-  return `https://docs.google.com/spreadsheets/d/${spreadsheetId}/gviz/tq?tqx=out:csv&gid=${gid}`;
+  validateSheetId(spreadsheetId, gid);
+  return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(spreadsheetId)}/gviz/tq?tqx=out:csv&gid=${encodeURIComponent(gid)}`;
 }
 
 function buildApiUrl(spreadsheetId: string, range: string, apiKey: string): string {
-  return `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}?key=${apiKey}`;
+  validateSheetId(spreadsheetId);
+  const url = new URL(`https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}`);
+  url.searchParams.set('key', apiKey);
+  return url.toString();
 }
 
 export function parseCsvText(csv: string): SheetParseResult {

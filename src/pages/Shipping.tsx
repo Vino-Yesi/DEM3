@@ -20,24 +20,10 @@ interface OrderLineItem {
 }
 
 interface TrackingResult {
-  status: 'in_transit' | 'delivered' | 'out_for_delivery';
-  location: string;
+  status: 'not_configured';
+  message: string;
   updatedAt: string;
 }
-
-const mockFromAddress = {
-  name: 'Vortex Warehouse',
-  street: '1234 Industrial Blvd',
-  city: 'San Francisco, CA 94107',
-  country: 'USA',
-};
-
-const mockToAddress = {
-  name: 'Customer Delivery',
-  street: '5678 Market Street, Apt 42',
-  city: 'New York, NY 10001',
-  country: 'USA',
-};
 
 function generateBarcodeArt(code: string): string {
   const blocks = '███ █ ████ █ █  ██  ███ █ ████ █ █  ██  ███ █ ████ █ █  ██  ███ █ ████ █ █  ██  ███ █ ████ █ █  ██  ███';
@@ -58,7 +44,7 @@ export default function Shipping() {
   const [generatedLabel, setGeneratedLabel] = useState<ShippingLabel | null>(null);
   const [printModalOpen, setPrintModalOpen] = useState(false);
   const [trackingModal, setTrackingModal] = useState<{ order: Order; result: TrackingResult } | null>(null);
-  const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info' | 'warning'; text: string } | null>(null);
   const [activeTab, setActiveTab] = useState<'ship' | 'tracking' | 'manifest'>('ship');
   const [copiedTracking, setCopiedTracking] = useState<string | null>(null);
 
@@ -76,6 +62,8 @@ export default function Shipping() {
   }, []);
 
   useEffect(() => {
+    // Initial Dexie read synchronizes this page with persisted order/shipping data.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadData();
   }, [loadData]);
 
@@ -146,15 +134,20 @@ export default function Shipping() {
 
   const handleGenerateLabel = async () => {
     if (!selectedOrder || !selectedRate) {
-      setMessage({ type: 'error', text: 'Select an order and a carrier rate first.' });
+      setMessage({ type: 'error', text: 'Select a local order and a carrier rate first.' });
+      return;
+    }
+    if (selectedOrder.sourceMarketplace) {
+      setMessage({ type: 'error', text: 'A live carrier-label adapter is not configured. Do not create a synthetic tracking number for a marketplace order; use the provider shipping workflow.' });
       return;
     }
     const weight = calculateOrderWeight(selectedOrder);
     const dims = calculateOrderDimensions(selectedOrder);
-    const trackingNumber = `TRK-${selectedRate.carrier.toUpperCase()}-${Date.now()}`;
+    const trackingNumber = `LOCAL-DEMO-${Date.now()}`;
     const labelData = JSON.stringify({
-      from: mockFromAddress,
-      to: mockToAddress,
+      from: 'Warehouse address not configured',
+      to: 'Recipient address not available in this local WMS record',
+      mode: 'demo-preview-only',
       carrier: selectedRate.carrier,
       service: selectedRate.service,
       trackingNumber,
@@ -196,7 +189,11 @@ export default function Shipping() {
 
   const handleShipOrder = async () => {
     if (!selectedOrder || !selectedRate || !generatedLabel) {
-      setMessage({ type: 'error', text: 'Generate label before shipping.' });
+      setMessage({ type: 'error', text: 'Create the local demo preview before recording this local shipment.' });
+      return;
+    }
+    if (selectedOrder.sourceMarketplace || !generatedLabel.trackingNumber.startsWith('LOCAL-DEMO-')) {
+      setMessage({ type: 'error', text: 'Marketplace shipments must be dispatched through the Marketplace Gateway. This screen does not create carrier bookings.' });
       return;
     }
     const weight = calculateOrderWeight(selectedOrder);
@@ -236,19 +233,18 @@ export default function Shipping() {
     setSelectedRate(null);
     setGeneratedLabel(null);
     setSuggestedBox(null);
-    setMessage({ type: 'success', text: `Order ${selectedOrder.orderId} shipped!` });
+    setMessage({ type: 'warning', text: `Recorded ${selectedOrder.orderId} as a local demo shipment. ${generatedLabel.trackingNumber} is synthetic; no carrier booking or tracking lookup occurred.` });
     if (user) {
-      await logAction('ORDER_SHIPPED', `Shipped ${selectedOrder.orderId} via ${selectedRate.carrier} ${selectedRate.service}`, user.displayName);
+      await logAction('ORDER_SHIPPED_DEMO', `Recorded local demo shipment ${selectedOrder.orderId} using synthetic tracking ${generatedLabel.trackingNumber}`, user.displayName);
     }
   };
 
   const handleTrack = (order: Order) => {
-    const statuses: TrackingResult['status'][] = ['in_transit', 'delivered', 'out_for_delivery'];
-    const status = statuses[Math.floor(Math.random() * statuses.length)];
-    const locations = ['Distribution Center NY', 'Regional Hub Chicago', 'Local Facility LA', 'Delivery Station SF'];
     const result: TrackingResult = {
-      status,
-      location: locations[Math.floor(Math.random() * locations.length)],
+      status: 'not_configured',
+      message: order.trackingNumber?.startsWith('LOCAL-DEMO-')
+        ? 'This is a synthetic local demo number. No carrier lookup was performed.'
+        : 'Live carrier tracking is not configured. Check the tracking number in the carrier or marketplace portal.',
       updatedAt: new Date().toISOString(),
     };
     setTrackingModal({ order, result });
@@ -310,7 +306,7 @@ export default function Shipping() {
             </div>
             <div>
               <h1 className="text-xl font-bold text-text-primary">Shipping</h1>
-              <p className="text-xs text-text-secondary">Fulfillment & carrier management</p>
+              <p className="text-xs text-text-secondary">Local demo preview only · no live carrier booking or tracking adapter</p>
             </div>
           </div>
           <div className="flex gap-2">
@@ -402,10 +398,12 @@ export default function Shipping() {
                   ? 'bg-accent-green/10 text-accent-green border border-accent-green/20'
                   : message.type === 'error'
                   ? 'bg-accent-red/10 text-accent-red border border-accent-red/20'
+                  : message.type === 'warning'
+                  ? 'bg-accent-yellow/10 text-accent-yellow border border-accent-yellow/20'
                   : 'bg-white/[0.03] text-text-secondary border border-white/[0.08]'
               }`}
             >
-              {message.type === 'success' ? <CheckCircle className="w-4 h-4" /> : message.type === 'error' ? <AlertTriangle className="w-4 h-4" /> : <Info className="w-4 h-4" />}
+              {message.type === 'success' ? <CheckCircle className="w-4 h-4" /> : message.type === 'error' || message.type === 'warning' ? <AlertTriangle className="w-4 h-4" /> : <Info className="w-4 h-4" />}
               {message.text}
               <button onClick={() => setMessage(null)} className="ml-auto hover:text-text-primary">
                 <X className="w-3 h-3" />
@@ -553,8 +551,9 @@ export default function Shipping() {
                     <div className="glass-panel rounded-lg p-4">
                       <div className="flex items-center gap-2 mb-3">
                         <DollarSign className="w-4 h-4 text-accent-yellow" />
-                        <h2 className="text-sm font-semibold">Rate Shopping</h2>
+                        <h2 className="text-sm font-semibold">Local Rate Estimates (not live)</h2>
                       </div>
+                      <p className="mb-2 text-[10px] leading-4 text-text-secondary">These rates are local estimates only. Marketplace orders must use the provider shipping workflow; no carrier API or customer addresses are available in this screen.</p>
                       <div className="overflow-x-auto">
                         <table className="w-full text-xs">
                           <thead>
@@ -589,11 +588,12 @@ export default function Shipping() {
                                   <td className="py-2.5 px-2 text-right">
                                     <button
                                       onClick={() => setSelectedRate(rate)}
-                                      className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors ${
+                                      disabled={Boolean(selectedOrder.sourceMarketplace)}
+                                      className={`px-2.5 py-1 rounded-md text-[10px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                                         isSelected ? 'bg-accent-sky text-void' : 'bg-white/[0.05] text-text-secondary hover:text-text-primary'
                                       }`}
                                     >
-                                      {isSelected ? 'Selected' : 'Select'}
+                                      {selectedOrder.sourceMarketplace ? 'Provider only' : isSelected ? 'Selected' : 'Select'}
                                     </button>
                                   </td>
                                 </tr>
@@ -608,24 +608,25 @@ export default function Shipping() {
                     <div className="flex flex-wrap gap-2">
                       <button
                         onClick={handleGenerateLabel}
-                        disabled={!selectedRate}
+                        disabled={!selectedRate || Boolean(selectedOrder.sourceMarketplace)}
+                        title={selectedOrder.sourceMarketplace ? 'Use the marketplace/provider shipping workflow' : 'Creates a clearly marked local demo preview only'}
                         className="flex items-center gap-2 px-4 py-2 rounded-md text-xs font-medium bg-white/[0.05] text-text-primary border border-white/[0.08] hover:bg-white/[0.08] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                       >
-                        <Barcode className="w-4 h-4" /> Generate Label
+                        <Barcode className="w-4 h-4" /> {selectedOrder.sourceMarketplace ? 'Provider label unavailable' : 'Preview Demo Label'}
                       </button>
                       <button
                         onClick={handlePrintLabel}
                         disabled={!generatedLabel}
                         className="flex items-center gap-2 px-4 py-2 rounded-md text-xs font-medium bg-white/[0.05] text-text-primary border border-white/[0.08] hover:bg-white/[0.08] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                       >
-                        <Printer className="w-4 h-4" /> Print Label
+                        <Printer className="w-4 h-4" /> Print Demo Preview
                       </button>
                       <button
                         onClick={handleShipOrder}
-                        disabled={!generatedLabel}
+                        disabled={!generatedLabel || Boolean(selectedOrder.sourceMarketplace)}
                         className="flex items-center gap-2 px-4 py-2 rounded-md text-xs font-medium bg-accent-sky text-void hover:bg-accent-sky/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                       >
-                        <Truck className="w-4 h-4" /> Confirm Shipment
+                        <Truck className="w-4 h-4" /> Record Demo Shipment
                       </button>
                     </div>
 
@@ -640,8 +641,9 @@ export default function Shipping() {
                         >
                           <div className="flex items-center gap-2 mb-3">
                             <Tag className="w-4 h-4 text-accent-green" />
-                            <h2 className="text-sm font-semibold">Label Preview</h2>
+                            <h2 className="text-sm font-semibold">Demo Label Preview — not carrier-issued</h2>
                           </div>
+                          <p className="mb-2 text-[10px] leading-4 text-accent-yellow">Synthetic tracking reference only. Addresses are unavailable; this preview cannot be used for postage or delivery.</p>
                           <div className="bg-white rounded-md p-4 text-void text-xs font-mono space-y-2">
                             <div className="flex justify-between items-start border-b border-gray-200 pb-2">
                               <div>
@@ -656,15 +658,13 @@ export default function Shipping() {
                             <div className="grid grid-cols-2 gap-2 py-2">
                               <div>
                                 <div className="text-gray-500 text-[10px] uppercase">From</div>
-                                <div className="font-semibold">{mockFromAddress.name}</div>
-                                <div>{mockFromAddress.street}</div>
-                                <div>{mockFromAddress.city}</div>
+                                <div className="font-semibold">Warehouse address not configured</div>
+                                <div className="text-[10px]">Preview only — not a mailing address</div>
                               </div>
                               <div>
                                 <div className="text-gray-500 text-[10px] uppercase">To</div>
-                                <div className="font-semibold">{mockToAddress.name}</div>
-                                <div>{mockToAddress.street}</div>
-                                <div>{mockToAddress.city}</div>
+                                <div className="font-semibold">Recipient address unavailable</div>
+                                <div className="text-[10px]">Use the marketplace/carrier portal</div>
                               </div>
                             </div>
                             <div className="text-center py-2">
@@ -826,13 +826,14 @@ export default function Shipping() {
               <div className="flex items-center justify-between p-4 border-b border-gray-100">
                 <div className="flex items-center gap-2 text-void">
                   <Printer className="w-4 h-4" />
-                  <span className="text-sm font-semibold">Print Label</span>
+                  <span className="text-sm font-semibold">Print Demo Preview (not carrier-issued)</span>
                 </div>
                 <button onClick={() => setPrintModalOpen(false)} className="text-gray-400 hover:text-gray-600">
                   <X className="w-4 h-4" />
                 </button>
               </div>
               <div className="p-6">
+                <p className="mb-3 text-xs leading-5 text-rose-700">DEMO PREVIEW ONLY — synthetic tracking, no carrier booking, and no real origin/recipient address.</p>
                 <div className="bg-white border border-gray-200 rounded-md p-4 text-void text-xs font-mono space-y-3 mb-4">
                   <div className="flex justify-between items-start border-b border-gray-200 pb-2">
                     <div>
@@ -847,15 +848,13 @@ export default function Shipping() {
                   <div className="grid grid-cols-2 gap-2 py-1">
                     <div>
                       <div className="text-gray-500 text-[10px] uppercase">From</div>
-                      <div className="font-semibold">{mockFromAddress.name}</div>
-                      <div>{mockFromAddress.street}</div>
-                      <div>{mockFromAddress.city}</div>
+                      <div className="font-semibold">Warehouse address not configured</div>
+                      <div className="text-[10px]">Preview only — not a mailing address</div>
                     </div>
                     <div>
                       <div className="text-gray-500 text-[10px] uppercase">To</div>
-                      <div className="font-semibold">{mockToAddress.name}</div>
-                      <div>{mockToAddress.street}</div>
-                      <div>{mockToAddress.city}</div>
+                      <div className="font-semibold">Recipient address unavailable</div>
+                      <div className="text-[10px]">Use the marketplace/carrier portal</div>
                     </div>
                   </div>
                   <div className="text-center py-2">
@@ -868,12 +867,12 @@ export default function Shipping() {
                   <button
                     onClick={() => {
                       window.print();
-                      setMessage({ type: 'success', text: 'Print job sent to printer.' });
+                      setMessage({ type: 'warning', text: 'Printed the local demo preview only; it is not a carrier label.' });
                       setPrintModalOpen(false);
                     }}
                     className="flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-md text-xs font-medium bg-accent-sky text-void hover:bg-accent-sky/90 transition-colors"
                   >
-                    <Printer className="w-4 h-4" /> Print Now
+                    <Printer className="w-4 h-4" /> Print Demo Preview
                   </button>
                   <button
                     onClick={() => setPrintModalOpen(false)}
@@ -920,20 +919,11 @@ export default function Shipping() {
                 <div className="bg-white/[0.02] rounded-lg p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="text-xs text-text-secondary">Status</span>
-                    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-                      trackingModal.result.status === 'delivered' ? 'bg-accent-green/10 text-accent-green' :
-                      trackingModal.result.status === 'out_for_delivery' ? 'bg-accent-yellow/10 text-accent-yellow' :
-                      'bg-white/[0.05] text-text-primary'
-                    }`}>
-                      {trackingModal.result.status.replace(/_/g, ' ')}
-                    </span>
+                    <span className="rounded-full bg-accent-yellow/10 px-2 py-0.5 text-xs font-semibold text-accent-yellow">Live lookup unavailable</span>
                   </div>
+                  <p role="status" className="text-xs leading-5 text-text-secondary">{trackingModal.result.message}</p>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs text-text-secondary">Location</span>
-                    <span className="text-xs text-text-primary">{trackingModal.result.location}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-text-secondary">Updated</span>
+                    <span className="text-xs text-text-secondary">Checked</span>
                     <span className="text-xs text-text-primary">{new Date(trackingModal.result.updatedAt).toLocaleString()}</span>
                   </div>
                 </div>

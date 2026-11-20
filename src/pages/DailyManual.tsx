@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import * as XLSX from 'xlsx';
+import * as XLSX from '@e965/xlsx';
 import {
   Upload, Package, PackageCheck, Truck, ClipboardList, Layers,
   FileSpreadsheet, CheckCircle2, ArrowRight, AlertTriangle,
