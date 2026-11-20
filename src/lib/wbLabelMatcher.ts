@@ -21,11 +21,16 @@ export interface WBLabelData {
   rawText: string;
   verticalText: string;
   rotationDetected: number; // degrees
+  /** OCR'd text recovered from an image-only page (empty when OCR not run/available). */
+  ocrText: string;
+  /** True when Tesseract OCR actually ran on this page. */
+  ocrRan: boolean;
 }
 
 export type WBMatchType =
   | 'exact'
   | 'tracking'
+  | 'sticker'
   | 'phone_code'
   | 'phone_only'
   | 'order_id'
@@ -55,9 +60,14 @@ export interface WBTarget {
 // Regex constants — identical to the Python module.
 const WB_TRACKING_RE = /WB[A-Z0-9]{10,20}/i;
 const WB_TRACKING_RE_G = /WB[A-Z0-9]{10,20}/gi;
-const WB_ORDER_RE = /\b\d{9,15}\b/g;
+// WB order IDs are 7-15 digits (Wildberries order/barcode prefix).
+const WB_ORDER_RE = /\b\d{7,15}\b/g;
 const PHONE_RE = /\b\d{7}\b/g;
 const CODE_RE = /\b\d{4}\b/g;
+// A WB sticker number is a 7-15 digit order id directly followed by a 4-digit
+// delivery code, e.g. "5971104 2531". This is the value users paste from the
+// picking sheet ("Стикер" column) and what is printed on every WB label.
+const WB_STICKER_RE = /\b(\d{7,15})\s+(\d{4})\b/;
 const VERTICAL_WB_RE = /W\s*B|WB/i;
 
 export function extractTracking(text: string): string | null {
@@ -65,7 +75,20 @@ export function extractTracking(text: string): string | null {
   return m ? m[0].toUpperCase() : null;
 }
 
+/**
+ * Extract a WB sticker number (order id + 4-digit delivery code) from text.
+ * Returns null when no sticker pair is present.
+ */
+export function extractStickerNumber(text: string): { orderId: string; code: string } | null {
+  const m = text.match(WB_STICKER_RE);
+  if (!m) return null;
+  return { orderId: m[1], code: m[2] };
+}
+
 export function extractOrderId(text: string): string | null {
+  // Prefer the order id half of a sticker pair when one is present.
+  const sticker = extractStickerNumber(text);
+  if (sticker) return sticker.orderId;
   const candidates = text.match(WB_ORDER_RE) || [];
   if (candidates.length === 0) return null;
   const first = candidates[0];
@@ -76,10 +99,17 @@ export function extractOrderId(text: string): string | null {
 
 export function extractPhone(text: string): string | null {
   const matches = text.match(PHONE_RE);
-  return matches && matches.length > 0 ? matches[0] : null;
+  if (!matches || matches.length === 0) return null;
+  // Never report a 7-digit sticker order id as a phone number.
+  const sticker = extractStickerNumber(text);
+  const clean = matches.filter((m) => !(sticker && m === sticker.orderId));
+  return clean.length > 0 ? clean[0] : null;
 }
 
 export function extractCode(text: string): string | null {
+  // Prefer the code half of a sticker pair when one is present.
+  const sticker = extractStickerNumber(text);
+  if (sticker) return sticker.code;
   const matches = text.match(CODE_RE);
   // The delivery code is typically the last 4-digit match on the page.
   return matches && matches.length > 0 ? matches[matches.length - 1] : null;
@@ -176,6 +206,18 @@ export function parseTargetList(text: string): WBTarget[] {
     const entry: WBTarget = { raw: line };
     const digits = line.match(/\d+/g) || [];
 
+    // WB sticker number: order id + 4-digit delivery code (e.g. "5971104 2531").
+    // Treat it as orderId + code rather than phone + code.
+    const sticker = line.match(WB_STICKER_RE);
+    if (sticker) {
+      entry.orderId = sticker[1];
+      entry.code = sticker[2];
+      const wbMatch = line.match(WB_TRACKING_RE);
+      if (wbMatch) entry.tracking = wbMatch[0].toUpperCase();
+      entries.push(entry);
+      continue;
+    }
+
     const wbMatch = line.match(WB_TRACKING_RE);
     if (wbMatch) entry.tracking = wbMatch[0].toUpperCase();
 
@@ -238,6 +280,17 @@ export function matchTargets(targets: WBTarget[], labelData: WBLabelData[]): WBL
           confidence = 1.0;
           matchType = 'exact';
           matchedFields.tracking = ld.trackingNumber;
+        }
+      }
+
+      // Criteria 1b: WB sticker number (order id + 4-digit delivery code).
+      // This is what users paste from the picking sheet ("Стикер" column).
+      if (confidence < 0.99 && targetOrder && targetCode && ld.wbOrderId && ld.deliveryCode) {
+        if (targetOrder === ld.wbOrderId && targetCode === ld.deliveryCode) {
+          confidence = 0.98;
+          matchType = 'sticker';
+          matchedFields.order_id = ld.wbOrderId;
+          matchedFields.code = ld.deliveryCode;
         }
       }
 

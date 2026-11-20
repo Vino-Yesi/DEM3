@@ -10,8 +10,9 @@
  *     that embed selectable text — the common case for WB/Ozon labels).
  *   • Optional per-page canvas render + native `BarcodeDetector` decode for
  *     barcodes/QR when the browser supports it (graceful feature detection).
- *   • No claim of full OCR parity; image-only labels with no embedded text and
- *     no detectable barcode are flagged to the caller.
+ *   • Optional Tesseract.js OCR on image-only pages (no embedded text / no
+ *     barcode). Requires `public/tessdata/eng.traineddata` (see
+ *     public/tessdata/README.md); gracefully disabled when missing.
  *
  * Ported from: wb_label_processor.py (v4.1)
  */
@@ -69,6 +70,8 @@ async function renderPageToCanvas(page: {
 export interface ProcessPdfOptions {
   /** Attempt barcode/QR decode via native BarcodeDetector when available. */
   detectBarcodes?: boolean;
+  /** Run Tesseract OCR on image-only pages (no embedded text / no barcode). */
+  ocr?: boolean;
   /** Called with progress (done, total) per page. */
   onProgress?: (done: number, total: number) => void;
 }
@@ -82,18 +85,58 @@ export async function processPdf(
   pdfDoc: PdfDocument,
   options: ProcessPdfOptions = {},
 ): Promise<import('./wbLabelMatcher').WBLabelData[]> {
-  const { detectBarcodes = true, onProgress } = options;
+  const { detectBarcodes = true, ocr = true, onProgress } = options;
   // Imported lazily to keep the pure matcher free of pdfjs at module load.
   const { extractTracking, extractOrderId, extractPhone, extractCode, extractAddress, parseQrPayload, scoreWbIndicators, WB_TRACKING_RE_G } =
     await import('./wbLabelMatcher');
+  const { ocrImage, isOcrAvailable } = await import('./ocr');
   const detector = detectBarcodes ? getBarcodeDetector() : null;
   const numPages = pdfDoc.numPages;
   const results: import('./wbLabelMatcher').WBLabelData[] = [];
 
+  const OCR_TEXT_THRESHOLD = 40; // embedded text length below which we treat the page as image-only
+  // Lazy OCR worker init: only pay the wasm/traineddata cost when a page
+  // actually needs it. Cached so subsequent pages reuse the result.
+  let ocrAvailable: boolean | null = null;
+  async function resolveOcrAvailable(): Promise<boolean> {
+    if (ocrAvailable !== null) return ocrAvailable;
+    ocrAvailable = ocr && (await isOcrAvailable());
+    return ocrAvailable;
+  }
+
   for (let i = 1; i <= numPages; i++) {
     const page = await pdfDoc.getPage(i);
     const textContent = await page.getTextContent();
-    const text = textContent.items.map((item) => ('str' in item ? (item as { str: string }).str : '')).join(' ');
+    const embeddedText = textContent.items.map((item) => ('str' in item ? (item as { str: string }).str : '')).join(' ');
+
+    // Decide whether to OCR: page has little embedded text, or no WB-relevant
+    // data could be extracted yet. Render the canvas once — it serves both
+    // barcode detection and OCR.
+    const likelyImageOnly = embeddedText.trim().length < OCR_TEXT_THRESHOLD;
+    let canvas: HTMLCanvasElement | null = null;
+    // Only initialize the OCR worker when a page actually looks image-only,
+    // so text-based PDFs never pay the wasm/traineddata cost.
+    let shouldOcr = false;
+    if (likelyImageOnly) {
+      shouldOcr = await resolveOcrAvailable();
+    }
+    if (detector || (shouldOcr && likelyImageOnly)) {
+      canvas = await renderPageToCanvas(page);
+    }
+
+    // Run OCR on image-only pages to recover sticker/tracking data.
+    let ocrText = '';
+    if (shouldOcr && canvas && likelyImageOnly) {
+      try {
+        const result = await ocrImage(canvas);
+        if (result.available) ocrText = result.text;
+      } catch {
+        // OCR failure is non-fatal; fall back to embedded text only.
+      }
+    }
+
+    // Combined text = embedded layer + OCR layer (OCR fills gaps on image-only labels).
+    const text = [embeddedText, ocrText].filter(Boolean).join(' ').trim();
 
     const data: import('./wbLabelMatcher').WBLabelData = {
       pageIdx: i - 1,
@@ -107,6 +150,8 @@ export async function processPdf(
       rawText: text,
       verticalText: '',
       rotationDetected: 0,
+      ocrText,
+      ocrRan: Boolean(ocrText),
     };
 
     // Field extraction — order mirrors the Python pipeline.
@@ -117,29 +162,26 @@ export async function processPdf(
     data.address = extractAddress(text);
 
     // Barcode/QR decode via native API (best-effort).
-    if (detector) {
-      const canvas = await renderPageToCanvas(page);
-      if (canvas) {
-        try {
-          const codes = await detector(canvas);
-          for (const bc of codes) {
-            const value = bc.rawValue;
-            data.barcodes.push(value);
-            const wb = value.match(WB_TRACKING_RE_G);
-            if (wb && wb.length > 0 && !data.trackingNumber) data.trackingNumber = wb[0].toUpperCase();
-            WB_TRACKING_RE_G.lastIndex = 0;
-            if (bc.format === 'qr_code') {
-              data.qrPayloads.push(value);
-              const parsed = parseQrPayload(value);
-              if (parsed.tracking && !data.trackingNumber) data.trackingNumber = parsed.tracking;
-              if (parsed.phone && !data.phoneNumber) data.phoneNumber = parsed.phone;
-              if (parsed.code && !data.deliveryCode) data.deliveryCode = parsed.code;
-              if (parsed.order_id && !data.wbOrderId) data.wbOrderId = parsed.order_id;
-            }
+    if (detector && canvas) {
+      try {
+        const codes = await detector(canvas);
+        for (const bc of codes) {
+          const value = bc.rawValue;
+          data.barcodes.push(value);
+          const wb = value.match(WB_TRACKING_RE_G);
+          if (wb && wb.length > 0 && !data.trackingNumber) data.trackingNumber = wb[0].toUpperCase();
+          WB_TRACKING_RE_G.lastIndex = 0;
+          if (bc.format === 'qr_code') {
+            data.qrPayloads.push(value);
+            const parsed = parseQrPayload(value);
+            if (parsed.tracking && !data.trackingNumber) data.trackingNumber = parsed.tracking;
+            if (parsed.phone && !data.phoneNumber) data.phoneNumber = parsed.phone;
+            if (parsed.code && !data.deliveryCode) data.deliveryCode = parsed.code;
+            if (parsed.order_id && !data.wbOrderId) data.wbOrderId = parsed.order_id;
           }
-        } catch {
-          // detection can fail on some pages; ignore
         }
+      } catch {
+        // detection can fail on some pages; ignore
       }
     }
 
