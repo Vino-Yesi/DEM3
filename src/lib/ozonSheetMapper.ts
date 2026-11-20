@@ -15,9 +15,9 @@ export interface MappedOzonOrder {
 }
 
 const COLUMN_ALIASES: Record<string, string[]> = {
-  orderId: ['order id', 'orderid', 'order', 'ord', 'posting id', 'posting', 'номер отправления', 'отправление', 'shipment', 'id'],
-  sku: ['sku', 'артикул', 'article', 'product sku', 'item sku', 'код товара'],
-  product: ['product', 'name', 'title', 'товар', 'наименование', 'description', 'item'],
+  orderId: ['order id', 'orderid', 'order', 'ord', 'posting id', 'posting', 'номер отправления', 'отправление', 'shipment'],
+  sku: ['sku', 'артикул', 'article', 'product sku', 'код товара'],
+  product: ['product', 'name', 'title', 'товар', 'наименование', 'description'],
   quantity: ['qty', 'quantity', 'количество', 'кол-во', 'count', 'amount'],
   status: ['status', 'статус', 'state', 'warehouse status', 'fulfillment'],
   tracking: ['tracking', 'tracking number', 'трек', 'трекинг', 'track id', 'ozon id'],
@@ -26,14 +26,22 @@ const COLUMN_ALIASES: Record<string, string[]> = {
 };
 
 function normalizeHeader(h: string): string {
-  return h.toLowerCase().replace(/[_\-./]+/g, ' ').trim();
+  return h.toLowerCase().replace(/[^a-z\u0400-\u04FF0-9]+/g, ' ').trim();
 }
 
+function headerTokens(norm: string): string[] {
+  return norm.split(/\s+/).filter(Boolean);
+}
+
+// Broad aliases such as bare "id" / "item" were removed above: they match
+// unrelated columns (e.g. a line-item "id" or "item name") and can select the
+// wrong spreadsheet column. Matching is whole-token based so a header like
+// "order date" can no longer be claimed by the "order" alias.
 function findColumn(headers: string[], field: keyof typeof COLUMN_ALIASES): string | null {
   const aliases = COLUMN_ALIASES[field];
   for (const h of headers) {
-    const norm = normalizeHeader(h);
-    if (aliases.some((a) => norm === a || norm.includes(a))) return h;
+    const tokens = headerTokens(normalizeHeader(h));
+    if (aliases.some((a) => tokens.includes(a))) return h;
   }
   return null;
 }
@@ -85,7 +93,10 @@ export function mapRowsToOzonOrders(
     throw new Error('Could not detect Order ID or SKU columns. Map columns manually or check sheet headers.');
   }
 
-  const grouped = new Map<string, MappedOzonOrder>();
+  // Group rows by order, keeping every row's hash so the group-level
+  // sheetRowHash reflects changes to ANY line in the order (not just the
+  // first row). This makes the sync's duplicate check catch later edits.
+  const grouped = new Map<string, { order: MappedOzonOrder; rowHashes: string[] }>();
 
   for (const row of rows) {
     const orderId = (orderCol ? row[orderCol] : '') || (skuCol ? `OZON-${row[skuCol]}` : '');
@@ -93,28 +104,34 @@ export function mapRowsToOzonOrders(
 
     const key = orderId.trim().toUpperCase();
     const sku = skuCol ? row[skuCol]?.trim() : '';
-    const qty = mapping.quantity ? parseInt(row[mapping.quantity] || '1', 10) || 1 : 1;
+    const qty = parseQuantity(mapping.quantity ? row[mapping.quantity] : undefined);
     const statusRaw = mapping.status ? row[mapping.status] : '';
     const status = mapStatus(statusRaw);
     const priority = mapPriority(mapping.priority ? row[mapping.priority] || '' : '', status);
 
     if (!grouped.has(key)) {
       grouped.set(key, {
-        orderId: key,
-        postingId: key,
-        skus: [],
-        skuQty: {},
-        product: mapping.product ? row[mapping.product] : undefined,
-        status,
-        trackingNumber: mapping.tracking ? row[mapping.tracking] : undefined,
-        city: mapping.city ? row[mapping.city] : undefined,
-        priority,
-        raw: row,
-        sheetRowHash: rowHash(row),
+        order: {
+          orderId: key,
+          postingId: key,
+          skus: [],
+          skuQty: {},
+          product: mapping.product ? row[mapping.product] : undefined,
+          status,
+          trackingNumber: mapping.tracking ? row[mapping.tracking] : undefined,
+          city: mapping.city ? row[mapping.city] : undefined,
+          priority,
+          raw: row,
+          sheetRowHash: '', // computed once all rows for the group are seen
+        },
+        rowHashes: [],
       });
     }
 
-    const order = grouped.get(key)!;
+    const group = grouped.get(key)!;
+    group.rowHashes.push(rowHash(row));
+
+    const order = group.order;
     if (sku) {
       order.skus.push(sku);
       order.skuQty[sku] = (order.skuQty[sku] || 0) + qty;
@@ -123,10 +140,29 @@ export function mapRowsToOzonOrders(
     if (mapping.status) order.status = mapStatus(row[mapping.status] || statusRaw);
   }
 
-  return Array.from(grouped.values()).map((o) => ({
-    ...o,
-    skus: [...new Set(o.skus)],
+  return Array.from(grouped.values()).map(({ order, rowHashes }) => ({
+    ...order,
+    skus: [...new Set(order.skus)],
+    // Group-level hash: any change to any line of the order changes the hash,
+    // so the sync duplicate check will not miss later edits.
+    sheetRowHash: hashString(rowHashes.slice().sort().join('||')),
   }));
+}
+
+/** Parse a quantity cell, rejecting negatives / zero / NaN and capping absurd values. */
+const MAX_QTY = 10_000;
+function parseQuantity(raw: string | undefined): number {
+  const parsed = raw == null ? NaN : parseInt(String(raw).trim() || '1', 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return 1; // negative / zero / non-numeric -> minimum
+  return Math.min(parsed, MAX_QTY); // cap excessive values
+}
+
+function hashString(s: string): string {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h).toString(16).padStart(8, '0');
 }
 
 export function toDbOrder(mapped: MappedOzonOrder): Omit<Order, 'id'> {
