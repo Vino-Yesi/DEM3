@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileText, ArrowUpDown, Download, Trash2, AlertTriangle, ScanBarcode, Sparkles, Maximize2, X, CheckCircle2, Filter } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -47,6 +47,16 @@ type SequencerMode = 'smart' | 'strict' | 'wb';
 const MAX_PDF_BYTES = 50 * 1024 * 1024;
 const MAX_PDF_PAGES = 1_000;
 
+/** Build display codes for a processed WB label page: tracking, sticker (order + code), barcodes. */
+function wbPageCodes(ld: WBLabelData): string[] {
+  const codes: string[] = [];
+  if (ld.trackingNumber) codes.push(ld.trackingNumber);
+  if (ld.wbOrderId && ld.deliveryCode) codes.push(`${ld.wbOrderId} ${ld.deliveryCode}`);
+  else if (ld.wbOrderId) codes.push(ld.wbOrderId);
+  for (const b of ld.barcodes.slice(0, 2)) codes.push(b);
+  return codes;
+}
+
 export default function PDFSequencer() {
   const [sequenceList, setSequenceList] = useState(() => {
     if (typeof window === 'undefined') return '';
@@ -73,7 +83,21 @@ export default function PDFSequencer() {
   const [wbData, setWbData] = useState<WBLabelData[]>([]);
   const [wbMatches, setWbMatches] = useState<WbMatchRow[]>([]);
   const [wbBarcodeSupported, setWbBarcodeSupported] = useState<boolean | null>(null);
+  const [ocrSupported, setOcrSupported] = useState<boolean | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Detect OCR (Tesseract) readiness on mount so the WB banner can advise users.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { isOcrAvailable } = await import('@/lib/ocr');
+      if (!cancelled) setOcrSupported(await isOcrAvailable());
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const [verifyOpen, setVerifyOpen] = useState(false);
   const [verifyFilter, setVerifyFilter] = useState<'all' | 'match' | 'missing' | 'extra'>('all');
 
@@ -463,7 +487,7 @@ export default function PDFSequencer() {
           sorted.push({
             id: m.pageIdx,
             text: ld.rawText.substring(0, 200),
-            codes: ld.trackingNumber ? [ld.trackingNumber] : (ld.barcodes.length ? [ld.barcodes[0] as string] : []),
+            codes: wbPageCodes(ld),
           });
           resultRows.push({
             status: '✅ MATCHED',
@@ -499,12 +523,12 @@ export default function PDFSequencer() {
           sorted.push({
             id: ld.pageIdx,
             text: ld.rawText.substring(0, 200),
-            codes: ld.trackingNumber ? [ld.trackingNumber] : (ld.barcodes.length ? [ld.barcodes[0] as string] : []),
+            codes: wbPageCodes(ld),
           });
           unmatched.push({
             status: 'ℹ️ EXTRA',
             sequenceOrder: 0,
-            id: ld.trackingNumber || ld.barcodes[0] || `Page ${ld.pageIdx + 1}`,
+            id: ld.trackingNumber || (ld.wbOrderId && ld.deliveryCode ? `${ld.wbOrderId} ${ld.deliveryCode}` : ld.wbOrderId || ld.barcodes[0]) || `Page ${ld.pageIdx + 1}`,
             originalPage: ld.pageIdx + 1,
             outputPage: outCounter++,
             notes: 'Extra page in PDF',
@@ -518,11 +542,18 @@ export default function PDFSequencer() {
       setWbMatches(wbRows);
 
       const detectedTracking = labelData.filter((d) => d.trackingNumber).length;
+      const detectedSticker = labelData.filter((d) => d.wbOrderId && d.deliveryCode).length;
+      const ocrRanCount = labelData.filter((d) => d.ocrRan).length;
+      const imageOnly = labelData.filter((d) => !d.rawText.trim() && !d.barcodes.length).length;
       const matchedCount = matches.length;
       const barcodeNote = !barcodeSupported ? ' No native barcode support in this browser — relied on embedded text only.' : '';
+      const ocrNote = ocrRanCount ? ` OCR recovered ${ocrRanCount} image-only page(s).` : '';
+      const imageOnlyNote = imageOnly
+        ? ` ${imageOnly} page(s) still unreadable (no embedded text, barcode, or OCR text).`
+        : '';
       setMessage({
         type: 'success',
-        text: `Processed ${labelData.length} pages. Detected ${detectedTracking} tracking numbers. Matched ${matchedCount} of ${targets.length} targets.${barcodeNote}`,
+        text: `Processed ${labelData.length} pages. Detected ${detectedSticker} sticker numbers and ${detectedTracking} tracking numbers. Matched ${matchedCount} of ${targets.length} targets.${barcodeNote}${ocrNote}${imageOnlyNote}`,
       });
     } catch (e: unknown) {
       console.error(e);
@@ -650,7 +681,10 @@ export default function PDFSequencer() {
             <Sparkles className="w-3.5 h-3.5 text-accent-sky flex-shrink-0 mt-0.5" />
             <p className="text-[10px] text-accent-sky">
               WB Advanced Mode: auto-detects WB tracking numbers, phone+code pairs, and order IDs from each pasted line, then matches labels by multiple criteria with confidence scores.
-              {wbBarcodeSupported === false ? ' No native barcode support in this browser — matching relies on embedded PDF text only (image-only labels may need OCR).' : ' Barcode/QR decode via native BarcodeDetector when supported.'}
+              {' '}
+              {ocrSupported === null ? 'Checking OCR…' : ocrSupported ? 'Tesseract OCR ready for image-only labels.' : 'Tesseract OCR unavailable (add public/tessdata/eng.traineddata).'}
+              {' | '}
+              {wbBarcodeSupported === false ? 'No native barcode support — text layer only.' : 'Barcode/QR via BarcodeDetector when supported.'}
             </p>
           </div>
         )}
@@ -671,7 +705,7 @@ export default function PDFSequencer() {
             spellCheck={false}
             onChange={(e) => setSequenceList(e.target.value)}
             className="w-full h-48 bg-transparent border border-white/[0.08] rounded-md p-3 text-xs text-text-primary font-mono resize-none focus:outline-none focus:border-accent-sky transition-colors"
-            placeholder={mode === 'wb' ? 'Paste any combination, one per line…\n• WB tracking: WBAERUGBACE0900JRM\n• Phone + Code: 5261288 1844\n• Order ID: 123456789' : marketplace === 'ozon' ? 'Paste IDs in the required order…\n123456789-1234-1\n987654321-4321-2' : 'Paste tracking IDs in the required order…\nOne ID per line, or copy a spreadsheet column'}
+            placeholder={mode === 'wb' ? 'Paste WB targets, one per line…\n• Sticker number: 5971104 2531 (order id + 4-digit code)\n• WB tracking: WBAERUGBACE0900JRM\n• Order ID: 123456789\n• Phone + Code: 5261288 1844' : marketplace === 'ozon' ? 'Paste IDs in the required order…\n123456789-1234-1\n987654321-4321-2' : 'Paste tracking IDs in the required order…\nOne ID per line, or copy a spreadsheet column'}
           />
           <div className="flex items-center gap-2 mt-3">
             <input

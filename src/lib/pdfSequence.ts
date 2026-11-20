@@ -31,7 +31,15 @@ export function extractTrackingIds(text: string, marketplace: PdfMarketplace): s
   } else if (marketplace === 'yandex-market') {
     patterns.push(/\b[A-Z0-9][A-Z0-9._/-]{6,30}[A-Z0-9]\b/gi, /\b\d{8,20}\b/g);
   } else {
-    patterns.push(/\bWB[A-Z0-9]{10,24}\b/gi, /\b\d{9,15}\b/g, /\b[A-Z0-9][A-Z0-9._/-]{8,30}[A-Z0-9]\b/gi);
+    // Wildberries: tracking numbers (WB-prefixed), order ids, and sticker
+    // numbers (order id + 4-digit delivery code, e.g. "5971104 2531") which is
+    // what users paste from the WB picking sheet ("Стикер" column).
+    patterns.push(
+      /\bWB[A-Z0-9]{10,24}\b/gi,
+      /\b\d{7,15}\b/g,
+      /\b(\d{7,15})\s+(\d{4})\b/g,
+      /\b[A-Z0-9][A-Z0-9._/-]{8,30}[A-Z0-9]\b/gi
+    );
   }
 
   const found = new Set<string>();
