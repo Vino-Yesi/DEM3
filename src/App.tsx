@@ -7,8 +7,11 @@ import OfflineIndicator from '@/components/OfflineIndicator';
 import InstallPrompt from '@/components/InstallPrompt';
 import { RouteErrorBoundary } from '@/components/ErrorBoundary';
 import Login from '@/pages/Login';
+import PasswordChange from '@/pages/PasswordChange';
 
 const DailyManual = lazy(() => import('@/pages/DailyManual'));
+const IntegrationHub = lazy(() => import('@/pages/IntegrationHub'));
+const OzonSheetsHub = lazy(() => import('@/pages/OzonSheetsHub'));
 const InventoryHub = lazy(() => import('@/pages/InventoryHub'));
 const SerialTracking = lazy(() => import('@/pages/SerialTracking'));
 const BatchPickCenter = lazy(() => import('@/pages/BatchPickCenter'));
@@ -44,6 +47,7 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
   if (loading) return <div className="fixed inset-0 flex items-center justify-center bg-void"><div className="w-8 h-8 border-2 border-accent-sky border-t-transparent rounded-full animate-spin" /></div>;
   if (!user) return <Navigate to="/login" replace />;
+  if (user.mustChangePassword) return <Navigate to="/change-password" replace />;
   return <>{children}</>;
 }
 
@@ -51,6 +55,7 @@ function AppRoutes() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+      <Route path="/change-password" element={<LazyPage component={PasswordChange} title="Change password" />} />
       <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route index element={<LazyPage component={DailyManual} title="Daily Manual" />} />
         <Route path="daily" element={<LazyPage component={DailyManual} title="Daily Manual" />} />
@@ -67,6 +72,8 @@ function AppRoutes() {
         <Route path="auditor" element={<LazyPage component={Auditor} title="Auditor" />} />
         <Route path="users" element={<LazyPage component={UserManagement} title="User Management" />} />
         <Route path="gsheet" element={<LazyPage component={GSheetHub} title="G-Sheet links" />} />
+        <Route path="integrations" element={<LazyPage component={IntegrationHub} title="Marketplace Integrations" />} />
+        <Route path="ozon-sheets" element={<LazyPage component={OzonSheetsHub} title="Ozon Sheets Hub" />} />
         <Route path="settings" element={<LazyPage component={Settings} title="Settings" />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
@@ -76,7 +83,27 @@ function AppRoutes() {
 
 export default function App() {
   const [ready, setReady] = useState(false);
-  useEffect(() => { seedDatabase().then(() => setReady(true)); }, []);
+  const [initError, setInitError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    void seedDatabase().then(() => {
+      if (active) setReady(true);
+    }).catch((error: unknown) => {
+      if (active) setInitError(error instanceof Error ? error.message : 'Local database could not be opened.');
+    });
+    return () => { active = false; };
+  }, []);
+  if (initError) {
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-black p-4">
+        <div role="alert" className="max-w-md rounded-xl border border-rose-400/20 bg-rose-400/10 p-5 text-center">
+          <h1 className="font-semibold text-white">Workspace startup failed</h1>
+          <p className="mt-2 text-sm text-white/65">{initError}</p>
+          <button type="button" onClick={() => window.location.reload()} className="mt-4 rounded-lg bg-white/10 px-4 py-2 text-sm text-white hover:bg-white/15">Retry</button>
+        </div>
+      </div>
+    );
+  }
   if (!ready) {
     return (
       <div className="fixed inset-0 flex items-center justify-center bg-black">

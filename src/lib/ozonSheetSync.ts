@@ -16,7 +16,8 @@ export interface SyncResult {
 export async function runSheetSync(
   config: SheetSyncConfig,
   operator: string,
-  file?: File
+  file?: File,
+  sessionApiKey?: string,
 ): Promise<SyncResult> {
   const result: SyncResult = { imported: 0, updated: 0, skipped: 0, errors: [], orders: [] };
   const start = Date.now();
@@ -31,7 +32,8 @@ export async function runSheetSync(
       const opts: SheetFetchOptions = {
         spreadsheetId: config.spreadsheetId,
         gid: config.gid,
-        apiKey: config.apiKey || undefined,
+        // Secrets are supplied for this sync only; never read them from IndexedDB.
+        apiKey: sessionApiKey || undefined,
         range: config.sheetRange || undefined,
       };
       parsed = await fetchSheet(opts, config.fetchMethod as 'gviz' | 'api' | 'auto');

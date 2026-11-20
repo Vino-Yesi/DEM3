@@ -1,5 +1,5 @@
 import { useMemo, useState, useCallback, useRef, type MouseEvent as ReactMouseEvent } from 'react';
-import * as XLSX from 'xlsx';
+import * as XLSX from '@e965/xlsx';
 import { motion, AnimatePresence, LayoutGroup } from 'framer-motion';
 import {
   Scale, Zap, AlertTriangle, CheckCircle, FileCheck, Upload,

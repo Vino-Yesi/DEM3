@@ -1,5 +1,6 @@
 import Dexie, { type Table } from 'dexie';
 import waveData from '@/data/ozon-wave.json';
+import { hashPassword, isPasswordHash, PASSWORD_MIN_LENGTH } from './passwords';
 
 // ─── Existing interfaces (enhanced) ─────────────────────────────────────
 export interface InventoryItem {
@@ -14,9 +15,11 @@ export interface InventoryItem {
   reorderPoint?: number;
   reorderQty?: number;
   updatedAt: string;
-  // NEW: Traceability & barcode
+  // Traceability & barcode
   barcode?: string;
   rfidTag?: string;
+  /** Non-PII provider SKUs/size ids used by the server-side marketplace adapters. */
+  marketplaceData?: string;
   length?: number;
   width?: number;
   height?: number;
@@ -42,6 +45,11 @@ export interface Order {
   assignedTo?: string;
   waveId?: string;
   batchId?: string;
+  // Marketplace OMS/WMS/TMS link fields (optional for legacy/manual orders).
+  sourceMarketplace?: 'ozon' | 'yandex-market' | 'wildberries';
+  marketplaceOrderId?: string;
+  /** Minimized, non-PII marketplace references required for dispatch/supply actions. */
+  marketplaceData?: string;
   // NEW: Shipping
   carrier?: string;
   service?: string;
@@ -97,10 +105,13 @@ export interface AuditLog {
 export interface User {
   id?: number;
   username: string;
+  /** PBKDF2-SHA256 hash (legacy plaintext values are upgraded at startup). */
   password: string;
   role: 'admin' | 'operator' | 'supervisor';
   displayName: string;
   createdAt: string;
+  /** Legacy demo accounts must choose a new password before using WMS pages. */
+  mustChangePassword?: boolean;
   // NEW: Labor
   skillLevel?: number; // 1-5
   preferredTaskTypes?: string; // JSON
@@ -875,14 +886,25 @@ export async function exportAllData() {
 // Seed data function
 export async function seedDatabase() {
   const now = new Date().toISOString();
-  const usersCount = await db.users.count();
-  if (usersCount === 0) {
-    await db.users.bulkAdd([
-      { username: "admin", password: "admin", role: "admin", displayName: "Administrator", createdAt: now, skillLevel: 5 },
-      { username: "VINOVJ", password: "VINOVJ", role: "admin", displayName: "Vino VJ", createdAt: now, skillLevel: 5 },
-      { username: "operator", password: "operator", role: "operator", displayName: "Floor Operator", createdAt: now, skillLevel: 3 },
-      { username: "supervisor", password: "supervisor", role: "supervisor", displayName: "Shift Supervisor", createdAt: now, skillLevel: 4 },
-    ]);
+
+  // Upgrade older installations that stored passwords as clear text. The old
+  // shipped demo credentials are forced through the password-change screen.
+  const oldDemoPasswords = new Set(['admin:admin', 'vinovj:vinovj', 'operator:operator', 'supervisor:supervisor']);
+  for (const user of await db.users.toArray()) {
+    if (isPasswordHash(user.password)) continue;
+    const mustChangePassword = Boolean(user.mustChangePassword) ||
+      user.password.length < PASSWORD_MIN_LENGTH ||
+      oldDemoPasswords.has(`${user.username.toLowerCase()}:${user.password.toLowerCase()}`);
+    await db.users.update(user.id!, {
+      password: await hashPassword(user.password),
+      mustChangePassword,
+    });
+  }
+
+  // API keys are not safe to persist in a browser database. Older Ozon sheet
+  // configs are scrubbed; admins can enter a key for one tab/session when needed.
+  for (const config of await db.sheetSyncConfigs.toArray()) {
+    if (config.apiKey) await db.sheetSyncConfigs.update(config.id!, { apiKey: undefined });
   }
 
   const invCount = await db.inventory.count();

@@ -10,7 +10,7 @@ import {
 import { db, type SheetSyncConfig, type SheetSyncLog } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
 import { useAppStore } from '@/lib/store';
-import { DEFAULT_OZON_SHEET, parseSheetUrl, fetchSheet, parseUploadedFile } from '@/lib/googleSheets';
+import { parseSheetUrl, fetchSheet, parseUploadedFile } from '@/lib/googleSheets';
 import { runSheetSync, getDetectedMappingPreview } from '@/lib/ozonSheetSync';
 import { getDeviceId, getDeviceName, getOnlineDevices, registerDeviceHeartbeat } from '@/lib/deviceRegistry';
 import { startAutomationLoop, stopAutomationLoop } from '@/lib/ozonAutomation';
@@ -18,12 +18,14 @@ import type { ConnectedDevice } from '@/lib/db';
 
 type SyncMethod = 'live' | 'api' | 'upload';
 
+const MAX_SHEET_UPLOAD_BYTES = 15 * 1024 * 1024;
+
 const PIPELINE_STEPS = [
   { id: 'sheet', label: 'Google Sheet', icon: FileSpreadsheet, color: 'text-accent-green' },
   { id: 'map', label: 'Column Mapper', icon: Database, color: 'text-accent-sky' },
   { id: 'orders', label: 'WMS Orders', icon: Package, color: 'text-accent-yellow' },
   { id: 'pick', label: 'Pick & Pack', icon: Layers, color: 'text-accent-sky' },
-  { id: 'post', label: 'Posting', icon: Camera, color: 'text-accent-green' },
+  { id: 'post', label: 'Tracking export', icon: Camera, color: 'text-accent-green' },
 ];
 
 export default function OzonSheetsHub() {
@@ -41,76 +43,79 @@ export default function OzonSheetsHub() {
   const [columnMap, setColumnMap] = useState<Record<string, string | null>>({});
   const [lastResult, setLastResult] = useState<{ imported: number; updated: number; skipped: number; errors: string[] } | null>(null);
   const [showAdmin, setShowAdmin] = useState(false);
-  const [automationOn, setAutomationOn] = useState(true);
+  const [automationOn, setAutomationOn] = useState(false);
+  const [sessionApiKey, setSessionApiKey] = useState('');
   const [pendingCount, setPendingCount] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [adminForm, setAdminForm] = useState({
-    sheetUrl: DEFAULT_OZON_SHEET.url,
-    apiKey: '',
+    sheetUrl: '',
     fetchMethod: 'auto' as SheetSyncConfig['fetchMethod'],
     syncIntervalMinutes: 15,
-    autoSync: true,
+    autoSync: false,
     autoAllocate: true,
     skipDuplicates: true,
   });
 
+  const registerLocalHeartbeat = useCallback(async () => {
+    await registerDeviceHeartbeat(operator);
+    setDevices(await getOnlineDevices());
+  }, [operator]);
+
   const load = useCallback(async () => {
     const configs = await db.sheetSyncConfigs.toArray();
-    const cfg = configs[0] || null;
+    let cfg = configs[0] || null;
+    if (cfg?.fetchMethod === 'api' && cfg.autoSync === 1 && cfg.id) {
+      await db.sheetSyncConfigs.update(cfg.id, { autoSync: 0 });
+      cfg = { ...cfg, autoSync: 0 };
+    }
     setConfig(cfg);
     if (cfg) {
-      setAdminForm({
-        sheetUrl: cfg.sheetUrl,
-        apiKey: cfg.apiKey || '',
-        fetchMethod: cfg.fetchMethod,
-        syncIntervalMinutes: cfg.syncIntervalMinutes,
-        autoSync: cfg.autoSync === 1,
-        autoAllocate: cfg.autoAllocate === 1,
-        skipDuplicates: cfg.skipDuplicates === 1,
-      });
-      setAutomationOn(cfg.autoSync === 1);
+      if (!showAdmin) {
+        setAdminForm({
+          sheetUrl: cfg.sheetUrl,
+          fetchMethod: cfg.fetchMethod,
+          syncIntervalMinutes: cfg.syncIntervalMinutes,
+          autoSync: cfg.autoSync === 1,
+          autoAllocate: cfg.autoAllocate === 1,
+          skipDuplicates: cfg.skipDuplicates === 1,
+        });
+      }
+      setAutomationOn(cfg.autoSync === 1 && cfg.fetchMethod !== 'api');
+    } else {
+      setAutomationOn(false);
     }
     const logData = await db.sheetSyncLogs.orderBy('createdAt').reverse().limit(20).toArray();
     setLogs(logData);
     setDevices(await getOnlineDevices());
     setPendingCount(await db.orders.where('status').equals('Pending').count());
     await registerLocalHeartbeat();
-  }, []);
-
-  const registerLocalHeartbeat = async () => {
-    await registerDeviceHeartbeat(operator);
-    setDevices(await getOnlineDevices());
-  };
+  }, [registerLocalHeartbeat, showAdmin]);
 
   useEffect(() => {
-    load();
+    // Load sheet settings and local sync history from IndexedDB.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load();
     const interval = setInterval(load, 30000);
     return () => clearInterval(interval);
   }, [load]);
 
   useEffect(() => {
-    if (automationOn && config?.autoSync === 1) {
+    if (automationOn && config?.autoSync === 1 && config.fetchMethod !== 'api') {
       startAutomationLoop(operator, 5);
     } else {
       stopAutomationLoop();
     }
     return () => stopAutomationLoop();
-  }, [automationOn, config?.autoSync, operator]);
+  }, [automationOn, config?.autoSync, config?.fetchMethod, operator]);
 
   const previewSheet = async () => {
     if (!config) return;
     try {
-      const parsed = adminForm.apiKey
-        ? await fetchSheet({
-            spreadsheetId: config.spreadsheetId,
-            gid: config.gid,
-            apiKey: adminForm.apiKey,
-          }, 'api')
-        : await fetchSheet({
-            spreadsheetId: config.spreadsheetId,
-            gid: config.gid,
-          }, 'gviz');
+      const parsed = await fetchSheet({
+        spreadsheetId: config.spreadsheetId,
+        gid: config.gid,
+      }, 'gviz');
       setPreviewHeaders(parsed.headers);
       setColumnMap(getDetectedMappingPreview(parsed.headers));
       addNotification({
@@ -129,7 +134,17 @@ export default function OzonSheetsHub() {
     setSyncing(true);
     setLastResult(null);
     try {
-      const result = await runSheetSync(config, operator, file);
+      const apiKeyForSync = !file && syncMethod === 'api' ? sessionApiKey.trim() : undefined;
+      if (!file && syncMethod === 'api' && !isAdmin) throw new Error('Only an admin can run API-key sync in this tab.');
+      if (!file && syncMethod === 'api' && !apiKeyForSync) throw new Error('Enter a restricted Google API key for this manual sync.');
+      const fetchMethod = !file && syncMethod === 'live'
+        ? 'gviz'
+        : !file && syncMethod === 'api'
+          ? 'api'
+          : config.fetchMethod;
+      const syncConfig = { ...config, fetchMethod, apiKey: undefined };
+      setSessionApiKey('');
+      const result = await runSheetSync(syncConfig, operator, file, apiKeyForSync);
       setLastResult(result);
       addNotification({
         title: 'Ozon Sheet Sync Complete',
@@ -142,6 +157,7 @@ export default function OzonSheetsHub() {
       addNotification({ title: 'Sync Failed', message: msg, type: 'error' });
       setLastResult({ imported: 0, updated: 0, skipped: 0, errors: [msg] });
     } finally {
+      setSessionApiKey('');
       setSyncing(false);
     }
   };
@@ -150,6 +166,9 @@ export default function OzonSheetsHub() {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
+      const extension = file.name.toLowerCase().split('.').pop();
+      if (!['csv', 'tsv', 'txt'].includes(extension || '')) throw new Error('Choose a CSV, TSV, or TXT sheet export.');
+      if (file.size > MAX_SHEET_UPLOAD_BYTES) throw new Error('Sheet uploads must be 15 MB or smaller. Split larger files and try again.');
       const parsed = await parseUploadedFile(file);
       setPreviewHeaders(parsed.headers);
       setColumnMap(getDetectedMappingPreview(parsed.headers));
@@ -165,41 +184,87 @@ export default function OzonSheetsHub() {
   };
 
   const saveAdminConfig = async () => {
-    if (!isAdmin || !config?.id) return;
+    if (!isAdmin) return;
     const parsed = parseSheetUrl(adminForm.sheetUrl);
+    if (!parsed) {
+      addNotification({
+        title: 'Invalid Google Sheets URL',
+        message: 'Use an HTTPS docs.google.com/spreadsheets URL. Do not put API keys or tokens in the URL.',
+        type: 'error',
+      });
+      return;
+    }
+
     const now = new Date().toISOString();
-    await db.sheetSyncConfigs.update(config.id, {
-      sheetUrl: adminForm.sheetUrl,
-      spreadsheetId: parsed?.spreadsheetId || config.spreadsheetId,
-      gid: parsed?.gid || config.gid,
-      apiKey: adminForm.apiKey || undefined,
+    const canAutoSync = adminForm.autoSync && adminForm.fetchMethod !== 'api';
+    const configToSave: SheetSyncConfig = {
+      name: config?.name || 'Ozon Sheets Orders',
+      spreadsheetId: parsed.spreadsheetId,
+      gid: parsed.gid,
+      sheetUrl: adminForm.sheetUrl.trim(),
       fetchMethod: adminForm.fetchMethod,
-      syncIntervalMinutes: adminForm.syncIntervalMinutes,
-      autoSync: adminForm.autoSync ? 1 : 0,
+      syncIntervalMinutes: Math.min(120, Math.max(5, adminForm.syncIntervalMinutes)),
+      autoSync: canAutoSync ? 1 : 0,
       autoAllocate: adminForm.autoAllocate ? 1 : 0,
       skipDuplicates: adminForm.skipDuplicates ? 1 : 0,
+      writeBackEnabled: config?.writeBackEnabled || 0,
+      createdAt: config?.createdAt || now,
       updatedAt: now,
-    });
-    setAutomationOn(adminForm.autoSync);
-    addNotification({ title: 'Config Saved', message: 'Sheet sync settings updated', type: 'success' });
-    await load();
-    setShowAdmin(false);
+      createdBy: config?.createdBy || operator,
+      sheetRange: config?.sheetRange,
+      columnMapping: config?.columnMapping,
+      apiKey: undefined,
+    };
+
+    try {
+      if (config?.id) await db.sheetSyncConfigs.update(config.id, configToSave);
+      else await db.sheetSyncConfigs.add(configToSave);
+      setAutomationOn(canAutoSync);
+      addNotification({
+        title: config?.id ? 'Config Saved' : 'Sheet Source Added',
+        message: adminForm.fetchMethod === 'api'
+          ? 'No API key is stored. API-key sync is manual; automatic sync was disabled.'
+          : 'Sheet settings saved. API keys are not stored.',
+        type: 'success',
+      });
+      await load();
+      setShowAdmin(false);
+    } catch (cause) {
+      addNotification({
+        title: 'Could not save sheet settings',
+        message: cause instanceof Error ? cause.message : 'Please try again.',
+        type: 'error',
+      });
+    }
   };
 
   const toggleAutomation = async () => {
     if (!isAdmin || !config?.id) return;
     const next = !automationOn;
+    if (next && config.fetchMethod === 'api') {
+      addNotification({
+        title: 'Auto-sync unavailable',
+        message: 'API keys are not saved. Choose gviz/auto for automatic sync, or enter a key for each manual API sync.',
+        type: 'warning',
+      });
+      setAutomationOn(false);
+      return;
+    }
     await db.sheetSyncConfigs.update(config.id, { autoSync: next ? 1 : 0 });
+    setConfig({ ...config, autoSync: next ? 1 : 0 });
     setAutomationOn(next);
-    setAdminForm((f) => ({ ...f, autoSync: next }));
+    setAdminForm((form) => ({ ...form, autoSync: next }));
     addNotification({
-      title: next ? 'Automation Enabled' : 'Automation Paused',
-      message: next ? `Auto-sync every ${config.syncIntervalMinutes} min` : 'Manual sync only',
+      title: next ? 'On-device auto-sync enabled' : 'Auto-sync paused',
+      message: next
+        ? `Checks every ${config.syncIntervalMinutes} min while this page is open on this device.`
+        : 'Manual sync only.',
       type: 'info',
     });
   };
 
   const onlineCount = devices.filter((d) => d.isOnline).length;
+  const safeSheetUrl = config && parseSheetUrl(config.sheetUrl) ? config.sheetUrl : null;
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -210,17 +275,17 @@ export default function OzonSheetsHub() {
             <Sheet className="w-5 h-5 text-accent-green" />
             <h1 className="text-xl font-bold text-text-primary">Ozon Sheets Hub</h1>
             <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent-green/20 text-accent-green uppercase tracking-wider">
-              Live Pipeline
+              On-device import
             </span>
           </div>
           <p className="text-sm text-text-secondary">
-            Google Sheets → Orders → Inventory → Pick/Pack → Posting
+            Google Sheets import → local WMS orders → Inventory → Pick/Pack → tracking export
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => handleSync()}
-            disabled={syncing || !config}
+            disabled={syncing || !config || syncMethod === 'upload' || !safeSheetUrl}
             className="flex items-center gap-2 px-4 py-2 rounded-lg bg-accent-sky text-black text-sm font-semibold hover:bg-accent-sky/90 disabled:opacity-50 transition-colors"
           >
             {syncing ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
@@ -235,15 +300,17 @@ export default function OzonSheetsHub() {
               Admin
             </button>
           )}
-          <a
-            href={config?.sheetUrl || DEFAULT_OZON_SHEET.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-sm text-text-secondary hover:text-accent-green transition-colors"
-          >
-            <ExternalLink className="w-4 h-4" />
-            Open Sheet
-          </a>
+          {safeSheetUrl && (
+            <a
+              href={safeSheetUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 text-sm text-text-secondary hover:text-accent-green transition-colors"
+            >
+              <ExternalLink className="w-4 h-4" />
+              Open Sheet
+            </a>
+          )}
         </div>
       </div>
 
@@ -304,7 +371,7 @@ export default function OzonSheetsHub() {
               ]).map((tab) => (
                 <button
                   key={tab.id}
-                  onClick={() => setSyncMethod(tab.id)}
+                  onClick={() => { setSyncMethod(tab.id); setSessionApiKey(''); }}
                   className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 text-sm transition-colors ${
                     syncMethod === tab.id
                       ? 'bg-accent-sky/10 text-accent-sky border-b-2 border-accent-sky'
@@ -322,16 +389,16 @@ export default function OzonSheetsHub() {
                 {syncMethod === 'live' && (
                   <motion.div key="live" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-3">
                     <p className="text-sm text-text-secondary">
-                      Fetches via Google gviz CSV. Sheet must be published: <strong className="text-text-primary">Anyone with link → Viewer</strong>.
+                      Fetches via Google gviz CSV. The sheet must be shared as <strong className="text-text-primary">Anyone with the link → Viewer</strong>.
                     </p>
                     <div className="p-3 rounded-lg bg-white/5 font-mono text-xs text-text-secondary break-all">
-                      {config?.sheetUrl || DEFAULT_OZON_SHEET.url}
+                      {safeSheetUrl || (config ? 'Saved URL is invalid. Re-enter an HTTPS Google Sheets URL in Admin settings.' : 'No sheet source configured. Open Admin to add an HTTPS Google Sheets URL.')}
                     </div>
                     <div className="flex gap-2">
-                      <button onClick={previewSheet} className="px-3 py-2 text-sm rounded-lg border border-white/10 hover:bg-white/5 text-text-secondary">
+                      <button onClick={previewSheet} disabled={!safeSheetUrl || syncing} className="px-3 py-2 text-sm rounded-lg border border-white/10 hover:bg-white/5 text-text-secondary disabled:opacity-50">
                         Preview Columns
                       </button>
-                      <button onClick={() => handleSync()} disabled={syncing} className="px-3 py-2 text-sm rounded-lg bg-accent-green/20 text-accent-green hover:bg-accent-green/30 disabled:opacity-50">
+                      <button onClick={() => handleSync()} disabled={!safeSheetUrl || syncing} className="px-3 py-2 text-sm rounded-lg bg-accent-green/20 text-accent-green hover:bg-accent-green/30 disabled:opacity-50">
                         Pull from Sheet
                       </button>
                     </div>
@@ -340,22 +407,26 @@ export default function OzonSheetsHub() {
                 {syncMethod === 'api' && (
                   <motion.div key="api" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-3">
                     <p className="text-sm text-text-secondary">
-                      Use Google Sheets API v4 with a restricted API key. Works on private sheets if shared with the service account or key has access.
+                      Enter a Google key restricted to the Sheets API and this site. The key is sent from this browser to Google and can be seen in browser network tools; it is not stored. A key alone cannot read private sheets.
                     </p>
                     {isAdmin ? (
-                      <input
-                        type="password"
-                        placeholder="Google API Key (admin only)"
-                        value={adminForm.apiKey}
-                        onChange={(e) => setAdminForm((f) => ({ ...f, apiKey: e.target.value }))}
-                        className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm text-text-primary placeholder:text-text-secondary/50"
-                      />
+                      <>
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          placeholder="Restricted Google API key (manual sync only)"
+                          value={sessionApiKey}
+                          onChange={(e) => setSessionApiKey(e.target.value)}
+                          className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm text-text-primary placeholder:text-text-secondary/50"
+                        />
+                        <p className="text-[10px] leading-4 text-text-secondary">Used for the next API sync only, then cleared. Auto-sync is disabled for API-key mode. Private Sheets need OAuth or a service-account backend, which is not configured here.</p>
+                      </>
                     ) : (
                       <p className="text-xs text-accent-yellow flex items-center gap-1">
-                        <Shield className="w-3 h-3" /> API key configured by admin
+                        <Shield className="w-3 h-3" /> API-key sync is admin-only; no key is saved in this browser.
                       </p>
                     )}
-                    <button onClick={() => handleSync()} disabled={syncing} className="px-3 py-2 text-sm rounded-lg bg-accent-sky/20 text-accent-sky hover:bg-accent-sky/30 disabled:opacity-50">
+                    <button onClick={() => handleSync()} disabled={syncing || !isAdmin || !config || !safeSheetUrl} className="px-3 py-2 text-sm rounded-lg bg-accent-sky/20 text-accent-sky hover:bg-accent-sky/30 disabled:opacity-50">
                       Sync via API
                     </button>
                   </motion.div>
@@ -501,6 +572,7 @@ export default function OzonSheetsHub() {
                 Auto-allocate inventory on import
               </li>
             </ul>
+            <p className="mt-2 text-[10px] leading-4 text-text-secondary">Checks run only while this page is open on this device. This is not a background or server-side job.</p>
           </div>
 
           {/* Recent logs */}
@@ -550,10 +622,14 @@ export default function OzonSheetsHub() {
               <div className="sm:col-span-2">
                 <label className="text-xs text-text-secondary block mb-1">Sheet URL</label>
                 <input
+                  type="url"
+                  autoComplete="off"
                   value={adminForm.sheetUrl}
                   onChange={(e) => setAdminForm((f) => ({ ...f, sheetUrl: e.target.value }))}
+                  placeholder="https://docs.google.com/spreadsheets/d/..."
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm"
                 />
+                <p className="mt-1 text-[10px] text-text-secondary">Saved locally. Keys or tokens in the URL are rejected; credentials are never stored.</p>
               </div>
               <div>
                 <label className="text-xs text-text-secondary block mb-1">Fetch Method</label>
@@ -578,15 +654,8 @@ export default function OzonSheetsHub() {
                   className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm"
                 />
               </div>
-              <div>
-                <label className="text-xs text-text-secondary block mb-1">Google API Key</label>
-                <input
-                  type="password"
-                  value={adminForm.apiKey}
-                  onChange={(e) => setAdminForm((f) => ({ ...f, apiKey: e.target.value }))}
-                  placeholder="Optional — for private sheets"
-                  className="w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm"
-                />
+              <div className="sm:col-span-2 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                <p className="text-[10px] leading-4 text-text-secondary">API keys are not saved here. Enter a restricted key in the API tab for each manual sync. API-key mode cannot run automatically.</p>
               </div>
               <div className="flex flex-wrap gap-4 items-center">
                 {(['autoSync', 'autoAllocate', 'skipDuplicates'] as const).map((key) => (

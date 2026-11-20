@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Upload, FileText, ArrowUpDown, Download, Trash2, AlertTriangle, ScanBarcode, Sparkles, Maximize2, X, CheckCircle2, Filter } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -12,6 +12,7 @@ import {
   type WBLabelMatch,
   type WBTarget,
 } from '@/lib/wbLabelProcessor';
+import { extractTrackingIds, matchTrackingSequence, normalizeTrackingId, parseTrackingSequence, type PdfMarketplace } from '@/lib/pdfSequence';
 
 // Configure PDF.js worker using local Vite asset URL
 if (typeof window !== "undefined") {
@@ -21,7 +22,6 @@ if (typeof window !== "undefined") {
 interface ExtractedPage {
   id: number;
   text: string;
-  cleanText: string;
   codes: string[];
 }
 
@@ -44,20 +44,31 @@ interface WbMatchRow {
 }
 
 type SequencerMode = 'smart' | 'strict' | 'wb';
+const MAX_PDF_BYTES = 50 * 1024 * 1024;
+const MAX_PDF_PAGES = 1_000;
 
 export default function PDFSequencer() {
-  const [sequenceList, setSequenceList] = useState('');
+  const [sequenceList, setSequenceList] = useState(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      return window.sessionStorage.getItem('wms-sequence') || '';
+    } catch {
+      return '';
+    }
+  });
   const [pages, setPages] = useState<ExtractedPage[]>([]);
   const [sortedPages, setSortedPages] = useState<ExtractedPage[]>([]);
   const [unmatchedPages, setUnmatchedPages] = useState<ResultRow[]>([]);
   const [duplicateIds, setDuplicateIds] = useState<{ id: string; count: number }[]>([]);
   const [pdfBytes, setPdfBytes] = useState<ArrayBuffer | null>(null);
   const [fileName, setFileName] = useState('');
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [processing, setProcessing] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
-  const [mode, setMode] = useState<SequencerMode>('smart');
-  const [removeDuplicates, setRemoveDuplicates] = useState(true);
+  const [mode, setMode] = useState<SequencerMode>('strict');
+  const [marketplace, setMarketplace] = useState<PdfMarketplace>('ozon');
+  const [removeDuplicates, setRemoveDuplicates] = useState(false);
   const [results, setResults] = useState<ResultRow[]>([]);
   const [wbData, setWbData] = useState<WBLabelData[]>([]);
   const [wbMatches, setWbMatches] = useState<WbMatchRow[]>([]);
@@ -66,25 +77,34 @@ export default function PDFSequencer() {
   const [verifyOpen, setVerifyOpen] = useState(false);
   const [verifyFilter, setVerifyFilter] = useState<'all' | 'match' | 'missing' | 'extra'>('all');
 
-  useEffect(() => {
-    try {
-      const saved = sessionStorage.getItem("wms-sequence");
-      if (saved && saved.trim()) setSequenceList(saved);
-    } catch {
-      /* ignore */
+  const processPdfFile = useCallback(async (file: File, selectedMarketplace: PdfMarketplace = marketplace) => {
+    if (file.size > MAX_PDF_BYTES) {
+      setPages([]);
+      setSortedPages([]);
+      setPdfBytes(null);
+      setSourceFile(null);
+      setFileName('');
+      setResults([]);
+      setUnmatchedPages([]);
+      setDuplicateIds([]);
+      setWbData([]);
+      setWbMatches([]);
+      setMessage({ type: 'error', text: `PDF files must be 50 MB or smaller. This file is ${(file.size / (1024 * 1024)).toFixed(1)} MB.` });
+      return;
     }
-  }, []);
-
-  const processPdfFile = useCallback(async (file: File) => {
-    const OZON_ID_REGEX = /\b\d{6,15}-\d{3,5}-\d{1,2}\b|\b\d{8,15}\b/g;
-    const OZON_LOOSE_REGEX = /(?:^|[^0-9])(\d{6,15}[-\s]?\d{3,5}[-\s]?\d{1,2})(?![0-9])/g;
-
     setProcessing(true);
     setMessage(null);
     setFileName(file.name);
+    setSourceFile(file);
     setResults([]);
     setUnmatchedPages([]);
     setDuplicateIds([]);
+    setPages([]);
+    setSortedPages([]);
+    setPdfBytes(null);
+    setWbData([]);
+    setWbMatches([]);
+    let destroyPdfTask: (() => Promise<void>) | undefined;
 
     try {
       const arrayBuffer = await file.arrayBuffer();
@@ -92,8 +112,15 @@ export default function PDFSequencer() {
       // so we keep a separate copy for pdf-lib to use during download
       setPdfBytes(arrayBuffer.slice(0));
 
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+      destroyPdfTask = () => loadingTask.destroy();
+      const pdf = await loadingTask.promise;
       const numPages = pdf.numPages;
+      if (numPages > MAX_PDF_PAGES) {
+        await loadingTask.destroy();
+        destroyPdfTask = undefined;
+        throw new Error(`The PDF has ${numPages} pages. The current safe limit is ${MAX_PDF_PAGES.toLocaleString()} pages.`);
+      }
       const extracted: ExtractedPage[] = [];
 
       // Native barcode detector (Chrome/Edge) for image-only label pages
@@ -115,26 +142,12 @@ export default function PDFSequencer() {
         setWbBarcodeSupported(false);
       }
 
-      const extractIdsFromString = (s: string): string[] => {
-        const found = new Set<string>();
-        const norm = s.replace(/\s+/g, ' ');
-        for (const m of norm.match(OZON_ID_REGEX) || []) found.add(m.trim());
-        OZON_LOOSE_REGEX.lastIndex = 0;
-        let lm: RegExpExecArray | null;
-        while ((lm = OZON_LOOSE_REGEX.exec(norm)) !== null) {
-          const v = lm[1].replace(/\s+/g, '-').replace(/-+/g, '-');
-          if (/\d{6,15}-\d{3,5}-\d{1,2}/.test(v) || /^\d{8,15}$/.test(v.replace(/-/g, ''))) {
-            found.add(v);
-          }
-        }
-        return [...found];
-      };
+      const extractIdsFromString = (value: string): string[] => extractTrackingIds(value, selectedMarketplace);
 
       for (let i = 1; i <= numPages; i++) {
         const page = await pdf.getPage(i);
         const textContent = await page.getTextContent();
-        const text = textContent.items.map((item: any) => (item && 'str' in item ? String(item.str || '') : '')).join(' ');
-        const cleanText = text.replace(/[-\s]/g, '');
+        const text = textContent.items.map((item) => ('str' in item ? item.str : '')).join(' ');
         const codes = new Set<string>(extractIdsFromString(text));
 
         // Canvas render + barcode scan for image-based labels
@@ -147,22 +160,22 @@ export default function PDFSequencer() {
             canvas.height = Math.floor(viewport.height);
             const ctx = canvas.getContext('2d');
             if (ctx) {
-              await page.render({ canvasContext: ctx, viewport } as any).promise;
+              await page.render({ canvas, canvasContext: ctx, viewport }).promise;
               const barcodes = await detector.detect(canvas);
               for (const b of barcodes) {
                 const raw = (b.rawValue || '').trim();
                 if (!raw) continue;
-                for (const id of extractIdsFromString(raw)) codes.add(id);
-                // Also keep raw barcode if it looks numeric/tracking-like
+                for (const id of extractIdsFromString(raw)) {
+                  codes.add(id);
+                }
+                // Keep an exact raw barcode too; user-pasted values are compared exactly.
                 const digits = raw.replace(/[-\s]/g, '');
-                if (/^\d{8,20}$/.test(digits)) codes.add(raw.includes('-') ? raw : digits);
-                else if (raw.length >= 8) codes.add(raw);
-              }
-              // OCR-lite: sometimes PDF text is empty but soft OCR from canvas isn't available;
-              // keep cleanText augmented with barcode digit strings for matching
-              if (codes.size) {
-                // append barcode digit forms into cleanText for includes() matching
-                // (handled below when building ExtractedPage)
+                if (/^\d{8,20}$/.test(digits)) {
+                  const barcodeId = raw.includes('-') ? raw : digits;
+                  codes.add(barcodeId);
+                } else if (raw.length >= 8) {
+                  codes.add(raw);
+                }
               }
             }
           } catch {
@@ -171,14 +184,15 @@ export default function PDFSequencer() {
         }
 
         const codeList = [...codes];
-        const barcodeDigits = codeList.map((c) => c.replace(/[-\s]/g, '')).join('');
         extracted.push({
           id: i - 1,
           text: (text || codeList.join(' ')).substring(0, 240),
-          cleanText: cleanText + barcodeDigits,
           codes: codeList,
         });
       }
+
+      await loadingTask.destroy();
+      destroyPdfTask = undefined;
 
       const totalMatches = extracted.reduce((sum, p) => sum + p.codes.length, 0);
       if (mode === 'wb') {
@@ -199,35 +213,43 @@ export default function PDFSequencer() {
       setPages(extracted);
       setSortedPages([]);
     } catch (e: unknown) {
+      if (destroyPdfTask) {
+        await destroyPdfTask().catch(() => undefined);
+        destroyPdfTask = undefined;
+      }
       console.error(e);
+      setPages([]);
+      setSortedPages([]);
+      setPdfBytes(null);
+      setSourceFile(null);
+      setFileName('');
       setMessage({ type: 'error', text: `Failed to process PDF: ${e instanceof Error ? e.message : 'Unknown error'}` });
     } finally {
       setProcessing(false);
     }
-  }, [mode]);
+  }, [mode, marketplace]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) void processPdfFile(file);
-  };
-
-  const loadSampleLabels = async () => {
-    try {
-      if (!sequenceList.trim()) {
-        const { default: wave } = await import("@/data/ozon-wave.json");
-        setSequenceList(wave.postings.map((p) => p.postingId).join("\n"));
-      }
-      const res = await fetch("/samples/labels.pdf");
-      if (!res.ok) throw new Error("Sample labels PDF not available");
-      const blob = await res.blob();
-      const file = new File([blob], "ozon-gbs-labels.pdf", { type: "application/pdf" });
-      await processPdfFile(file);
-    } catch (e: unknown) {
-      setMessage({
-        type: "error",
-        text: `Could not load sample labels: ${e instanceof Error ? e.message : "unknown error"}`,
-      });
+    if (!file) return;
+    const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+    if (!isPdf) {
+      setPages([]);
+      setSortedPages([]);
+      setPdfBytes(null);
+      setSourceFile(null);
+      setFileName('');
+      setResults([]);
+      setUnmatchedPages([]);
+      setDuplicateIds([]);
+      setWbData([]);
+      setWbMatches([]);
+      setMessage({ type: 'error', text: 'Choose a PDF label file.' });
+      e.target.value = '';
+      return;
     }
+    void processPdfFile(file);
+    e.target.value = '';
   };
 
   const handleSort = () => {
@@ -236,19 +258,23 @@ export default function PDFSequencer() {
       return;
     }
 
-    let targetIdsRaw = sequenceList.split('\n').map(t => t.trim()).filter(Boolean);
+    let targetIdsRaw = parseTrackingSequence(sequenceList);
+    if (targetIdsRaw.length === 0) {
+      setMessage({ type: 'error', text: 'No tracking IDs were found. Paste one ID per line or a copied spreadsheet column.' });
+      return;
+    }
 
     // Detect and track duplicates before deduplication
     const rawCountMap = new Map<string, number>();
     for (const tid of targetIdsRaw) {
-      const key = tid.replace(/[-\s]/g, '').toLowerCase();
+      const key = normalizeTrackingId(tid);
       rawCountMap.set(key, (rawCountMap.get(key) || 0) + 1);
     }
     const foundDuplicates: { id: string; count: number }[] = [];
     rawCountMap.forEach((count, key) => {
       if (count > 1) {
         // find the original formatted ID
-        const original = targetIdsRaw.find(t => t.replace(/[-\s]/g, '').toLowerCase() === key) || key;
+        const original = targetIdsRaw.find(t => normalizeTrackingId(t) === key) || key;
         foundDuplicates.push({ id: original, count });
       }
     });
@@ -259,7 +285,7 @@ export default function PDFSequencer() {
       const seen = new Set<string>();
       const cleaned: string[] = [];
       for (const tid of targetIdsRaw) {
-        const key = tid.replace(/[-\s]/g, '').toLowerCase();
+        const key = normalizeTrackingId(tid);
         if (!seen.has(key)) {
           seen.add(key);
           cleaned.push(tid);
@@ -270,44 +296,10 @@ export default function PDFSequencer() {
 
     const targetIds = targetIdsRaw.map(t => t.trim());
 
-    const pageMap = new Map<string, ExtractedPage>();
-    const usedPages = new Set<number>();
-
-    // Robust matching: strip hyphens/spaces; also compare against extracted codes
-    const findPageForTarget = (tid: string): ExtractedPage | undefined => {
-      const searchStr = tid.replace(/[-\s]/g, '').toLowerCase();
-      if (searchStr.length < 6) return undefined;
-      // 1) Exact / includes on cleanText
-      let matchedPage = pages.find(
-        (p) => !usedPages.has(p.id) && p.cleanText.toLowerCase().includes(searchStr)
-      );
-      if (matchedPage) return matchedPage;
-      // 2) Match any extracted code (normalized)
-      matchedPage = pages.find((p) => {
-        if (usedPages.has(p.id)) return false;
-        return p.codes.some((c) => {
-          const cn = c.replace(/[-\s]/g, '').toLowerCase();
-          return cn === searchStr || cn.includes(searchStr) || searchStr.includes(cn);
-        });
-      });
-      if (matchedPage) return matchedPage;
-      // 3) Suffix / core match (last 10–12 digits often unique on labels)
-      if (searchStr.length >= 10) {
-        const core = searchStr.slice(-12);
-        matchedPage = pages.find(
-          (p) => !usedPages.has(p.id) && p.cleanText.toLowerCase().includes(core)
-        );
-      }
-      return matchedPage;
-    };
-
-    targetIds.forEach((tid) => {
-      const matchedPage = findPageForTarget(tid);
-      if (matchedPage) {
-        pageMap.set(tid, matchedPage);
-        usedPages.add(matchedPage.id);
-      }
-    });
+    const pageMap = matchTrackingSequence(targetIds, pages);
+    const usedPages = new Set<number>(
+      pageMap.filter((page): page is ExtractedPage => Boolean(page)).map((page) => page.id),
+    );
 
     const sorted: ExtractedPage[] = [];
     const resultRows: ResultRow[] = [];
@@ -319,8 +311,8 @@ export default function PDFSequencer() {
       // Strict: only pages matching sequence
       for (let i = 0; i < targetIds.length; i++) {
         const tid = targetIds[i];
-        if (pageMap.has(tid)) {
-          const page = pageMap.get(tid)!;
+        const page = pageMap[i];
+        if (page) {
           sorted.push(page);
           resultRows.push({
             status: '✅ INCLUDED',
@@ -346,8 +338,8 @@ export default function PDFSequencer() {
       // Smart: matched first, then extras
       for (let i = 0; i < targetIds.length; i++) {
         const tid = targetIds[i];
-        if (pageMap.has(tid)) {
-          const page = pageMap.get(tid)!;
+        const page = pageMap[i];
+        if (page) {
           sorted.push(page);
           resultRows.push({
             status: '✅ MATCHED',
@@ -471,7 +463,6 @@ export default function PDFSequencer() {
           sorted.push({
             id: m.pageIdx,
             text: ld.rawText.substring(0, 200),
-            cleanText: ld.rawText.replace(/[-\s]/g, ''),
             codes: ld.trackingNumber ? [ld.trackingNumber] : (ld.barcodes.length ? [ld.barcodes[0] as string] : []),
           });
           resultRows.push({
@@ -508,7 +499,6 @@ export default function PDFSequencer() {
           sorted.push({
             id: ld.pageIdx,
             text: ld.rawText.substring(0, 200),
-            cleanText: ld.rawText.replace(/[-\s]/g, ''),
             codes: ld.trackingNumber ? [ld.trackingNumber] : (ld.barcodes.length ? [ld.barcodes[0] as string] : []),
           });
           unmatched.push({
@@ -546,8 +536,14 @@ export default function PDFSequencer() {
     setPages([]);
     setSortedPages([]);
     setPdfBytes(null);
+    setSourceFile(null);
     setSequenceList('');
     setFileName('');
+    try {
+      sessionStorage.removeItem('wms-sequence');
+    } catch {
+      // Storage may be disabled in private browsing; in-memory clear still works.
+    }
     setMessage(null);
     setResults([]);
     setUnmatchedPages([]);
@@ -576,7 +572,7 @@ export default function PDFSequencer() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
       setMessage({ type: 'success', text: `✅ Downloaded ${sortedPages.length} sorted pages as PDF!` });
     } catch (e: unknown) {
       console.error(e);
@@ -619,10 +615,34 @@ export default function PDFSequencer() {
             </button>
           ))}
         </div>
+        {mode !== 'wb' && (
+          <div className="mt-3 grid gap-2 sm:grid-cols-[180px_1fr] sm:items-center">
+            <label htmlFor="pdf-marketplace" className="text-xs font-medium text-text-primary">Tracking ID format</label>
+            <div>
+              <select
+                id="pdf-marketplace"
+                value={marketplace}
+                disabled={processing}
+                onChange={(event) => {
+                  const nextMarketplace = event.target.value as PdfMarketplace;
+                  setMarketplace(nextMarketplace);
+                  setMessage(null);
+                  if (sourceFile) void processPdfFile(sourceFile, nextMarketplace);
+                }}
+                className="w-full rounded-md border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-xs text-text-primary disabled:opacity-50"
+              >
+                <option value="ozon">Ozon</option>
+                <option value="yandex-market">Yandex Market</option>
+                <option value="wildberries">Wildberries</option>
+              </select>
+              <p className="mt-1 text-[10px] text-text-secondary">Changing this re-scans the current PDF. IDs are matched exactly after ignoring spaces and hyphens.</p>
+            </div>
+          </div>
+        )}
         {mode === 'strict' && (
           <div className="mt-2 p-2 bg-accent-yellow/10 border border-accent-yellow/20 rounded-md flex items-start gap-2">
             <AlertTriangle className="w-3.5 h-3.5 text-accent-yellow flex-shrink-0 mt-0.5" />
-            <p className="text-[10px] text-accent-yellow">Strict Mode: Pages NOT in your list will be EXCLUDED from the output.</p>
+            <p className="text-[10px] text-accent-yellow">Strict Rearrange is on by default: only matched pages are downloaded, in the exact order you pasted. Missing IDs are listed below and do not shift the remaining pages.</p>
           </div>
         )}
         {mode === 'wb' && (
@@ -645,9 +665,13 @@ export default function PDFSequencer() {
           </div>
           <textarea
             value={sequenceList}
+            aria-label="Paste tracking IDs in the required PDF page order"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
             onChange={(e) => setSequenceList(e.target.value)}
             className="w-full h-48 bg-transparent border border-white/[0.08] rounded-md p-3 text-xs text-text-primary font-mono resize-none focus:outline-none focus:border-accent-sky transition-colors"
-            placeholder={mode === 'wb' ? 'Paste any combination, one per line…\n• WB tracking: WBAERUGBACE0900JRM\n• Phone + Code: 5261288 1844\n• Order ID: 123456789' : 'Paste tracking IDs here, one per line...\n1234-5678-9\n9876-5432-1'}
+            placeholder={mode === 'wb' ? 'Paste any combination, one per line…\n• WB tracking: WBAERUGBACE0900JRM\n• Phone + Code: 5261288 1844\n• Order ID: 123456789' : marketplace === 'ozon' ? 'Paste IDs in the required order…\n123456789-1234-1\n987654321-4321-2' : 'Paste tracking IDs in the required order…\nOne ID per line, or copy a spreadsheet column'}
           />
           <div className="flex items-center gap-2 mt-3">
             <input
@@ -657,10 +681,10 @@ export default function PDFSequencer() {
               onChange={(e) => setRemoveDuplicates(e.target.checked)}
               className="w-3.5 h-3.5 accent-accent-sky"
             />
-            <label htmlFor="removeDups" className="text-[10px] text-text-secondary">Auto-remove duplicate IDs</label>
+            <label htmlFor="removeDups" className="text-[10px] text-text-secondary">Remove repeated IDs (optional)</label>
           </div>
           <p className="text-[10px] text-text-secondary mt-2">
-            {sequenceList.split('\n').filter(Boolean).length} tracking IDs
+            {parseTrackingSequence(sequenceList).length} tracking IDs · pasted order is preserved
           </p>
         </div>
 
@@ -682,17 +706,6 @@ export default function PDFSequencer() {
             <p className="text-xs text-text-secondary">{processing ? "Reading PDF…" : "Click to upload PDF"}</p>
             <p className="text-[10px] text-text-secondary/60 mt-1">PDF files only</p>
           </div>
-          <button
-            type="button"
-            disabled={processing}
-            onClick={(e) => {
-              e.stopPropagation();
-              void loadSampleLabels();
-            }}
-            className="mt-3 w-full rounded-md border border-accent-sky/30 bg-accent-sky/10 px-3 py-2 text-xs text-accent-sky hover:bg-accent-sky/15 disabled:opacity-50"
-          >
-            Load GBS Express labels (60 pages)
-          </button>
           <input
             ref={fileInputRef}
             type="file"
@@ -766,6 +779,7 @@ export default function PDFSequencer() {
                   initial={{ opacity: 0, x: -10 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: i * 0.02 }}
+                  data-testid={`sorted-page-${i + 1}`}
                   className="flex items-center gap-2 p-2 bg-white/[0.02] border border-white/[0.06] rounded-md"
                 >
                   <span className="text-[10px] text-accent-green/60 font-mono w-5 flex-shrink-0">{i + 1}</span>

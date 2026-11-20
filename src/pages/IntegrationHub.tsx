@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { db, logAction, type IntegrationEndpoint } from '@/lib/db';
 import { useAuth } from '@/lib/auth';
 import { useAppStore } from '@/lib/store';
 import { runSheetSync } from '@/lib/ozonSheetSync';
+import MarketplaceExchange from '@/components/MarketplaceExchange';
 import {
   Plug, Server, Cloud, CloudCog, RefreshCw, AlertTriangle,
   CheckCircle, XCircle, Globe, ShoppingCart, Truck, Database,
@@ -16,12 +17,9 @@ import {
 
 type EndpointType = IntegrationEndpoint['type'];
 type EndpointStatus = IntegrationEndpoint['status'];
+type EndpointAuthType = 'api_key' | 'oauth2' | 'basic';
 
-interface SyncStep {
-  label: string;
-  detail: string;
-  durationMs: number;
-}
+interface IntegrationConfig { endpoint?: string; authType?: EndpointAuthType }
 
 interface FlowNode {
   id: string;
@@ -62,19 +60,11 @@ const TYPE_LABELS: Record<EndpointType, string> = {
 };
 
 const STATUS_STYLES: Record<EndpointStatus, { dot: string; bg: string; text: string; label: string }> = {
-  active:   { dot: 'bg-accent-green',   bg: 'bg-accent-green/10',   text: 'text-accent-green',   label: 'Active' },
+  active:   { dot: 'bg-accent-green',   bg: 'bg-accent-green/10',   text: 'text-accent-green',   label: 'Enabled (manual)' },
   inactive: { dot: 'bg-text-secondary', bg: 'bg-white/5',           text: 'text-text-secondary', label: 'Inactive' },
   error:    { dot: 'bg-accent-red',     bg: 'bg-accent-red/10',     text: 'text-accent-red',     label: 'Error' },
   syncing:  { dot: 'bg-accent-yellow',  bg: 'bg-accent-yellow/10',  text: 'text-accent-yellow',  label: 'Syncing' },
 };
-
-const SYNC_STEPS: SyncStep[] = [
-  { label: 'Connecting', detail: 'Establishing secure connection…', durationMs: 800 },
-  { label: 'Fetching Orders', detail: 'Pulling new order data…', durationMs: 1200 },
-  { label: 'Updating Inventory', detail: 'Syncing stock levels…', durationMs: 1000 },
-  { label: 'Shipping Labels', detail: 'Syncing carrier labels…', durationMs: 900 },
-  { label: 'Finalizing', detail: 'Committing changes…', durationMs: 700 },
-];
 
 /* ─── Component ────────────────────────────────────────────── */
 
@@ -87,6 +77,7 @@ export default function IntegrationHub() {
   const [endpoints, setEndpoints] = useState<IntegrationEndpoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
 
   /* Modals */
   const [showAdd, setShowAdd] = useState(false);
@@ -95,12 +86,10 @@ export default function IntegrationHub() {
   const [showLogs, setShowLogs] = useState(false);
   const [selected, setSelected] = useState<IntegrationEndpoint | null>(null);
 
-  /* Sync simulator */
-  const [syncStep, setSyncStep] = useState(0);
-  const [syncPercent, setSyncPercent] = useState(0);
+  /* Real Ozon Sheets sync state; unsupported connectors are reported honestly. */
   const [syncMessage, setSyncMessage] = useState('');
   const [syncComplete, setSyncComplete] = useState(false);
-  const syncAbortRef = useRef(false);
+  const [syncResult, setSyncResult] = useState<'success' | 'warning' | 'error'>('warning');
 
   /* Form */
   const [form, setForm] = useState({
@@ -108,38 +97,43 @@ export default function IntegrationHub() {
     type: 'erp' as EndpointType,
     provider: '',
     endpointUrl: '',
-    authType: 'api_key' as 'api_key' | 'oauth2' | 'basic',
+    authType: 'api_key' as EndpointAuthType,
     syncInterval: 60,
   });
 
   /* Load data */
   const load = useCallback(async () => {
     setRefreshing(true);
-    const data = await db.integrationEndpoints.toArray();
-    // Ensure nextSync is computed if missing
-    const now = Date.now();
-    const enriched = data.map(e => {
-      if (!e.nextSync && e.status === 'active' && e.syncInterval) {
-        const next = new Date(now + e.syncInterval * 60000).toISOString();
-        return { ...e, nextSync: next };
-      }
-      return e;
-    });
-    setEndpoints(enriched);
-    setRefreshing(false);
-    setLoading(false);
+    try {
+      const data = await db.integrationEndpoints.toArray();
+      setEndpoints(data);
+    } finally {
+      setRefreshing(false);
+      setLoading(false);
+    }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    let cancelled = false;
+    const loadInitial = async () => {
+      try {
+        const data = await db.integrationEndpoints.toArray();
+        if (!cancelled) setEndpoints(data);
+      } catch (error) {
+        console.error('Failed to load connector profiles', error);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void loadInitial();
+    return () => { cancelled = true; };
+  }, []);
 
   /* ─── Stats ─────────────────────────────────────────────── */
   const total = endpoints.length;
   const active = endpoints.filter(e => e.status === 'active').length;
   const errors = endpoints.filter(e => e.status === 'error').length;
-  const recordsToday = endpoints.reduce((s, e) => s + (e.recordsSynced || 0), 0);
-  const nextSync = endpoints
-    .filter(e => e.status === 'active' && e.nextSync)
-    .sort((a, b) => new Date(a.nextSync!).getTime() - new Date(b.nextSync!).getTime())[0]?.nextSync;
+  const totalRecordsSynced = endpoints.reduce((s, e) => s + (e.recordsSynced || 0), 0);
 
   /* ─── Actions ───────────────────────────────────────────── */
 
@@ -147,10 +141,11 @@ export default function IntegrationHub() {
     setForm({ name: '', type: 'erp', provider: '', endpointUrl: '', authType: 'api_key', syncInterval: 60 });
   };
 
-  const openAdd = () => { resetForm(); setShowAdd(true); };
+  const openAdd = () => { setFormError(null); resetForm(); setShowAdd(true); };
 
   const openEdit = (ep: IntegrationEndpoint) => {
     const cfg = parseConfig(ep.config);
+    setFormError(null);
     setForm({
       name: ep.name,
       type: ep.type,
@@ -163,30 +158,53 @@ export default function IntegrationHub() {
     setShowEdit(true);
   };
 
-  const parseConfig = (json: string): any => {
-    try { return JSON.parse(json); } catch { return {}; }
+  const parseConfig = (json: string): IntegrationConfig => {
+    try {
+      const value = JSON.parse(json) as unknown;
+      if (!value || typeof value !== 'object') return {};
+      const config = value as Record<string, unknown>;
+      const authType = config.authType;
+      return {
+        endpoint: typeof config.endpoint === 'string' ? config.endpoint : '',
+        authType: authType === 'oauth2' || authType === 'basic' ? authType : 'api_key',
+      };
+    } catch { return {}; }
+  };
+
+  const validateEndpoint = (value: string): string | null => {
+    if (!value.trim()) return null;
+    try {
+      const url = new URL(value.trim());
+      if (url.protocol !== 'https:') return 'Use an HTTPS endpoint. Plain HTTP can expose order data.';
+      if (url.username || url.password) return 'Do not put a username or password in the endpoint URL.';
+      if ([...url.searchParams.keys()].some((key) => /key|token|secret|password|auth/i.test(key))) {
+        return 'Remove API keys or tokens from the URL. This profile is not a secret store.';
+      }
+      return null;
+    } catch { return 'Enter a valid HTTPS URL or leave the endpoint blank.'; }
   };
 
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!form.name || !form.provider) return;
-    const config = JSON.stringify({ endpoint: form.endpointUrl, authType: form.authType });
+    if (!form.name.trim() || !form.provider.trim()) return;
+    const endpointError = validateEndpoint(form.endpointUrl);
+    if (endpointError) { setFormError(endpointError); return; }
+    const config = JSON.stringify({ endpoint: form.endpointUrl.trim(), authType: form.authType });
     const now = new Date().toISOString();
-    const nextSync = new Date(Date.now() + form.syncInterval * 60000).toISOString();
     await db.integrationEndpoints.add({
-      name: form.name,
+      name: form.name.trim(),
       type: form.type,
-      provider: form.provider,
+      provider: form.provider.trim(),
       config,
-      status: 'active',
+      status: 'inactive',
       lastSync: undefined,
-      nextSync,
-      syncInterval: form.syncInterval,
+      nextSync: undefined,
+      syncInterval: Math.min(1440, Math.max(1, form.syncInterval)),
       recordsSynced: 0,
       errorCount: 0,
       createdAt: now,
     });
-    await logAction('INTEGRATION_ADD', `Added integration ${form.name}`, operator);
+    await logAction('INTEGRATION_ADD', `Added connector profile ${form.name.trim()}`, operator);
     setShowAdd(false);
     resetForm();
     load();
@@ -194,18 +212,19 @@ export default function IntegrationHub() {
 
   const handleEdit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selected?.id) return;
-    const config = JSON.stringify({ endpoint: form.endpointUrl, authType: form.authType });
-    const nextSync = new Date(Date.now() + form.syncInterval * 60000).toISOString();
+    if (!selected?.id || !form.name.trim() || !form.provider.trim()) return;
+    const endpointError = validateEndpoint(form.endpointUrl);
+    if (endpointError) { setFormError(endpointError); return; }
+    const config = JSON.stringify({ endpoint: form.endpointUrl.trim(), authType: form.authType });
     await db.integrationEndpoints.update(selected.id, {
-      name: form.name,
+      name: form.name.trim(),
       type: form.type,
-      provider: form.provider,
+      provider: form.provider.trim(),
       config,
-      syncInterval: form.syncInterval,
-      nextSync,
+      syncInterval: Math.min(1440, Math.max(1, form.syncInterval)),
+      nextSync: undefined,
     });
-    await logAction('INTEGRATION_EDIT', `Edited integration ${form.name}`, operator);
+    await logAction('INTEGRATION_EDIT', `Edited connector profile ${form.name.trim()}`, operator);
     setShowEdit(false);
     setSelected(null);
     resetForm();
@@ -223,91 +242,71 @@ export default function IntegrationHub() {
   const handleSyncNow = async (ep: IntegrationEndpoint) => {
     if (!ep.id) return;
     setSelected(ep);
-    setSyncStep(0);
-    setSyncPercent(0);
-    setSyncMessage('Preparing sync…');
+    setSyncMessage('Checking the configured connector…');
     setSyncComplete(false);
+    setSyncResult('warning');
     setShowSync(true);
-    syncAbortRef.current = false;
 
-    await db.integrationEndpoints.update(ep.id, { status: 'syncing' });
-    load();
-
-    let currentPercent = 0;
-    for (let i = 0; i < SYNC_STEPS.length; i++) {
-      if (syncAbortRef.current) break;
-      setSyncStep(i);
-      setSyncMessage(SYNC_STEPS[i].detail);
-      const stepDuration = SYNC_STEPS[i].durationMs;
-      const stepTarget = ((i + 1) / SYNC_STEPS.length) * 100;
-      const increment = (stepTarget - currentPercent) / (stepDuration / 50);
-
-      for (let t = 0; t < stepDuration; t += 50) {
-        if (syncAbortRef.current) break;
-        currentPercent = Math.min(currentPercent + increment, stepTarget);
-        setSyncPercent(Math.round(currentPercent));
-        await new Promise(r => setTimeout(r, 50));
-      }
-      currentPercent = stepTarget;
-      setSyncPercent(Math.round(currentPercent));
-    }
-
-    if (syncAbortRef.current) {
-      setShowSync(false);
-      await db.integrationEndpoints.update(ep.id, { status: 'error', lastError: 'Sync aborted by user' });
-      load();
+    const isOzon = ep.provider.toLowerCase().includes('ozon') || ep.name.toLowerCase().includes('ozon');
+    if (!isOzon) {
+      setSyncMessage('This saved connector profile is not bound to a provider adapter. Use the Marketplace Exchange above for configured live API actions or the file workflow. No records were changed.');
+      setSyncComplete(true);
+      setSyncResult('warning');
       return;
     }
 
-    let recordsAdded = Math.floor(Math.random() * 50 + 10);
-    let syncDetail = `${recordsAdded} records`;
-
-    if (ep.provider === 'Ozon' || ep.name.toLowerCase().includes('ozon')) {
-      setSyncMessage('Pulling Ozon orders from Google Sheets…');
-      const configs = await db.sheetSyncConfigs.toArray();
-      const sheetConfig = configs[0];
-      if (sheetConfig) {
-        try {
-          const result = await runSheetSync(sheetConfig, operator);
-          recordsAdded = result.imported + result.updated;
-          syncDetail = `+${result.imported} new, ~${result.updated} updated`;
-          addNotification({
-            title: 'Ozon Sheet Sync',
-            message: syncDetail,
-            type: result.errors.length ? 'warning' : 'success',
-          });
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : 'Sheet sync failed';
-          await db.integrationEndpoints.update(ep.id, {
-            status: 'error',
-            lastError: msg,
-          });
-          addNotification({ title: 'Ozon Sync Failed', message: msg, type: 'error' });
-          setShowSync(false);
-          load();
-          return;
-        }
-      }
+    const config = (await db.sheetSyncConfigs.toArray())[0];
+    if (!config) {
+      setSyncMessage('Ozon Sheets is not configured yet. Open Ozon Sheets from the sidebar to set up an import source.');
+      setSyncComplete(true);
+      setSyncResult('warning');
+      return;
+    }
+    if (config.fetchMethod === 'api') {
+      setSyncMessage('This sheet is configured for API-key mode, but Integration Hub does not hold API keys. Open Ozon Sheets and run a manual API sync there. No records were changed.');
+      setSyncComplete(true);
+      setSyncResult('warning');
+      return;
     }
 
-    const now = new Date().toISOString();
-    const nextSync = new Date(Date.now() + (ep.syncInterval || 60) * 60000).toISOString();
-    await db.integrationEndpoints.update(ep.id, {
-      status: 'active',
-      lastSync: now,
-      nextSync,
-      recordsSynced: (ep.recordsSynced || 0) + recordsAdded,
-    });
-    await logAction('INTEGRATION_SYNC', `Synced ${ep.name} — ${syncDetail}`, operator);
-    setSyncComplete(true);
-    setSyncMessage(`Sync complete! ${recordsAdded} records processed.`);
-    load();
+    try {
+      await db.integrationEndpoints.update(ep.id, { status: 'syncing', lastError: undefined });
+      await load();
+      setSyncMessage('Reading Ozon order rows from the configured sheet…');
+      const result = await runSheetSync(config, operator);
+      const recordsAdded = result.imported + result.updated;
+      const syncDetail = `+${result.imported} new, ~${result.updated} updated`;
+      const now = new Date().toISOString();
+      await db.integrationEndpoints.update(ep.id, {
+        status: result.errors.length ? 'error' : ep.status === 'active' ? 'active' : 'inactive',
+        lastSync: now,
+        nextSync: undefined,
+        recordsSynced: (ep.recordsSynced || 0) + recordsAdded,
+        errorCount: (ep.errorCount || 0) + result.errors.length,
+        lastError: result.errors[0],
+      });
+      await logAction('INTEGRATION_SYNC', `Ozon Sheets ${ep.name} — ${syncDetail}`, operator);
+      addNotification({ title: 'Ozon Sheet Sync', message: syncDetail, type: result.errors.length ? 'warning' : 'success' });
+      setSyncMessage(`Sync complete: ${syncDetail}${result.errors.length ? ` · ${result.errors.length} row error(s)` : ''}.`);
+      setSyncResult(result.errors.length ? 'warning' : 'success');
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : 'Sheet sync failed';
+      await db.integrationEndpoints.update(ep.id, {
+        status: 'error',
+        lastSync: new Date().toISOString(),
+        lastError: message,
+        errorCount: (ep.errorCount || 0) + 1,
+      });
+      addNotification({ title: 'Ozon Sync Failed', message, type: 'error' });
+      setSyncMessage(message);
+      setSyncResult('error');
+    } finally {
+      setSyncComplete(true);
+      await load();
+    }
   };
 
-  const closeSync = () => {
-    syncAbortRef.current = true;
-    setShowSync(false);
-  };
+  const closeSync = () => setShowSync(false);
 
   const handleViewLogs = async (ep: IntegrationEndpoint) => {
     setSelected(ep);
@@ -324,17 +323,6 @@ export default function IntegrationHub() {
     load();
   };
 
-  const handleRetryErrors = async () => {
-    const errorEps = endpoints.filter(e => e.status === 'error');
-    for (const ep of errorEps) {
-      if (ep.id) {
-        await db.integrationEndpoints.update(ep.id, { status: 'active', lastError: undefined });
-      }
-    }
-    await logAction('INTEGRATION_RETRY', `Retried ${errorEps.length} error endpoints`, operator);
-    load();
-  };
-
   const handleDelete = async (ep: IntegrationEndpoint) => {
     if (!ep.id) return;
     if (!confirm(`Delete integration "${ep.name}"? This cannot be undone.`)) return;
@@ -346,7 +334,7 @@ export default function IntegrationHub() {
   /* ─── Flow Visualizer Data ──────────────────────────────── */
   const flowNodes: FlowNode[] = [
     { id: 'erp', label: 'ERP', icon: Database, count: endpoints.filter(e => e.type === 'erp').reduce((s, e) => s + e.recordsSynced, 0), color: 'text-accent-sky' },
-    { id: 'wms', label: 'WMS', icon: Server, count: recordsToday, color: 'text-accent-green' },
+    { id: 'wms', label: 'WMS', icon: Server, count: totalRecordsSynced, color: 'text-accent-green' },
     { id: 'oms', label: 'OMS', icon: ShoppingCart, count: endpoints.filter(e => e.type === 'oms').reduce((s, e) => s + e.recordsSynced, 0), color: 'text-accent-yellow' },
     { id: 'tms', label: 'TMS', icon: Truck, count: endpoints.filter(e => e.type === 'tms').reduce((s, e) => s + e.recordsSynced, 0), color: 'text-accent-sky' },
     { id: 'customer', label: 'Customer', icon: Globe, count: 0, color: 'text-text-primary' },
@@ -370,13 +358,10 @@ export default function IntegrationHub() {
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-bold text-text-primary">Integration Hub</h1>
-            <span className="relative flex h-2.5 w-2.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent-green opacity-75" />
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-accent-green" />
-            </span>
+            <span className="rounded-full border border-accent-yellow/20 bg-accent-yellow/10 px-2 py-0.5 text-[10px] font-medium text-accent-yellow">Manual only</span>
           </div>
           <p className="text-sm text-text-secondary mt-1">
-            Manage connected systems, data flows, and sync pipelines
+            Saved profiles are not live connections. Ozon Sheets supports on-demand import; Ozon, Yandex Market and Wildberries use local files.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -401,10 +386,10 @@ export default function IntegrationHub() {
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         {[
           { label: 'Total Integrations', value: total, icon: Plug, color: 'text-text-primary', delay: 0 },
-          { label: 'Active Connections', value: active, icon: Wifi, color: 'text-accent-green', delay: 0.05 },
+          { label: 'Enabled Profiles', value: active, icon: Wifi, color: 'text-accent-green', delay: 0.05 },
           { label: 'Sync Errors', value: errors, icon: AlertTriangle, color: 'text-accent-red', alert: errors > 0, delay: 0.1 },
-          { label: 'Records Synced', value: recordsToday.toLocaleString(), icon: Database, color: 'text-accent-sky', delay: 0.15 },
-          { label: 'Next Sync', value: nextSync ? new Date(nextSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—', icon: Clock, color: 'text-accent-yellow', delay: 0.2 },
+          { label: 'Records Imported / Updated', value: totalRecordsSynced.toLocaleString(), icon: Database, color: 'text-accent-sky', delay: 0.15 },
+          { label: 'Sync Mode', value: 'On demand', icon: Clock, color: 'text-accent-yellow', delay: 0.2 },
         ].map((kpi) => (
           <motion.div
             key={kpi.label}
@@ -430,6 +415,8 @@ export default function IntegrationHub() {
         ))}
       </div>
 
+      <MarketplaceExchange />
+
       {/* Data Flow Visualizer */}
       <motion.div
         initial={{ opacity: 0, y: 20 }}
@@ -440,7 +427,7 @@ export default function IntegrationHub() {
         <div className="flex items-center gap-2 mb-4">
           <Activity className="w-4 h-4 text-accent-sky" />
           <h3 className="text-sm font-semibold text-text-primary">Data Flow Visualizer</h3>
-          <span className="ml-auto text-[10px] text-text-secondary">Live pipeline</span>
+          <span className="ml-auto text-[10px] text-text-secondary">Local workflow map</span>
         </div>
 
         <div className="flex flex-col lg:flex-row items-center justify-center gap-2 lg:gap-0 py-4">
@@ -502,9 +489,9 @@ export default function IntegrationHub() {
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
             <Layers className="w-4 h-4 text-accent-sky" />
-            <h3 className="text-sm font-semibold text-text-primary">Connected Systems</h3>
+            <h3 className="text-sm font-semibold text-text-primary">Saved Connector Profiles</h3>
           </div>
-          <span className="text-[10px] text-text-secondary">{active} active · {errors} errors</span>
+          <span className="text-[10px] text-text-secondary">{active} enabled · {errors} sync errors</span>
         </div>
 
         {loading ? (
@@ -516,7 +503,7 @@ export default function IntegrationHub() {
           <div className="glass-panel rounded-lg p-8 text-center">
             <Plug className="w-8 h-8 text-text-secondary mx-auto mb-3" />
             <p className="text-sm text-text-primary font-medium">No integrations configured</p>
-            <p className="text-xs text-text-secondary mt-1">Add your first system to start syncing data.</p>
+            <p className="text-xs text-text-secondary mt-1">Add a manual profile, or use the Marketplace Exchange above for configured live adapters and file workflows.</p>
             <button onClick={openAdd} className="mt-4 px-4 py-2 rounded-lg bg-accent-sky text-void text-xs font-semibold hover:opacity-90">
               Add Integration
             </button>
@@ -562,14 +549,14 @@ export default function IntegrationHub() {
                         <p className={`text-xs font-bold font-mono ${ep.errorCount > 0 ? 'text-accent-red' : 'text-text-primary'}`}>{ep.errorCount || 0}</p>
                       </div>
                       <div className="bg-white/[0.02] rounded-md p-2 text-center">
-                        <p className="text-[10px] text-text-secondary">Interval</p>
-                        <p className="text-xs font-bold text-text-primary font-mono">{ep.syncInterval}m</p>
+                        <p className="text-[10px] text-text-secondary">Run mode</p>
+                        <p className="text-xs font-bold text-text-primary font-mono">Manual</p>
                       </div>
                     </div>
 
                     <div className="flex items-center justify-between text-[10px] text-text-secondary mb-3">
                       <span>Last: {ep.lastSync ? new Date(ep.lastSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Never'}</span>
-                      <span>Next: {ep.nextSync ? new Date(ep.nextSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}</span>
+                      <span>Next: Manual</span>
                     </div>
 
                     {/* Action Buttons */}
@@ -599,7 +586,7 @@ export default function IntegrationHub() {
                       <button
                         onClick={() => handleToggle(ep)}
                         className={`px-2 py-1.5 rounded-md transition-all ${ep.status === 'active' ? 'bg-accent-green/10 text-accent-green hover:bg-accent-green/20' : 'bg-white/[0.04] text-text-secondary hover:bg-white/[0.08]'}`}
-                        title={ep.status === 'active' ? 'Disable' : 'Enable'}
+                        title={ep.status === 'active' ? 'Disable saved profile' : 'Enable saved profile'}
                       >
                         {ep.status === 'active' ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
                       </button>
@@ -638,18 +625,11 @@ export default function IntegrationHub() {
             {errorEndpoints.length > 0 && (
               <>
                 <button
-                  onClick={handleRetryErrors}
-                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-white/[0.04] hover:bg-white/[0.08] text-text-secondary hover:text-text-primary text-[10px] transition-all"
-                >
-                  <RefreshCw className="w-3 h-3" />
-                  Retry All
-                </button>
-                <button
                   onClick={handleClearErrors}
                   className="flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-white/[0.04] hover:bg-accent-red/10 text-text-secondary hover:text-accent-red text-[10px] transition-all"
                 >
                   <Ban className="w-3 h-3" />
-                  Clear All
+                  Dismiss All
                 </button>
               </>
             )}
@@ -659,7 +639,7 @@ export default function IntegrationHub() {
         {errorEndpoints.length === 0 ? (
           <div className="flex items-center justify-center gap-2 py-6 text-text-secondary">
             <CheckCircle className="w-4 h-4 text-accent-green" />
-            <span className="text-xs">No sync errors — all systems operational</span>
+            <span className="text-xs">No stored connector errors</span>
           </div>
         ) : (
           <div className="space-y-2 max-h-[280px] overflow-y-auto pr-1">
@@ -681,20 +661,15 @@ export default function IntegrationHub() {
                   <p className="text-[10px] text-accent-red mt-0.5 truncate">{ep.lastError || 'Unknown error'}</p>
                 </div>
                 <div className="text-right shrink-0">
-                  <p className="text-[10px] text-text-secondary font-mono">
-                    {ep.lastSync ? new Date(ep.lastSync).toLocaleTimeString() : '—'}
-                  </p>
-                  <p className="text-[10px] text-text-secondary mt-0.5">Retry: {ep.errorCount || 0}</p>
+                  <p className="text-[10px] text-text-secondary mt-0.5">Failures: {ep.errorCount || 0}</p>
                 </div>
                 <button
-                  onClick={async () => {
-                    if (!ep.id) return;
-                    await db.integrationEndpoints.update(ep.id, { status: 'active', lastError: undefined });
-                    load();
-                  }}
-                  className="px-2 py-1 rounded-md bg-accent-green/10 text-accent-green text-[10px] font-medium hover:bg-accent-green/20 transition-all"
+                  type="button"
+                  onClick={() => void handleSyncNow(ep)}
+                  disabled={ep.status === 'syncing'}
+                  className="px-2 py-1 rounded-md bg-white/[0.06] text-text-primary text-[10px] font-medium hover:bg-white/[0.1] transition-all disabled:opacity-50"
                 >
-                  Retry
+                  Try sync
                 </button>
               </motion.div>
             ))}
@@ -764,17 +739,19 @@ export default function IntegrationHub() {
                   <label className="text-[10px] text-text-secondary uppercase tracking-wider mb-1 block">Endpoint URL</label>
                   <input
                     value={form.endpointUrl}
-                    onChange={e => setForm(f => ({ ...f, endpointUrl: e.target.value }))}
+                    onChange={e => { setForm(f => ({ ...f, endpointUrl: e.target.value })); setFormError(null); }}
                     className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md text-xs text-text-primary px-3 py-2 focus:outline-none focus:border-accent-sky/50"
                     placeholder="https://api.example.com/v1"
                   />
                 </div>
+                <p className="text-[10px] leading-4 text-text-secondary">This saves connector details only. Do not paste API secrets here; live sync credentials belong in a secure server-side connector.</p>
+                {formError && <p role="alert" className="text-[10px] text-accent-red">{formError}</p>}
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="text-[10px] text-text-secondary uppercase tracking-wider mb-1 block">Auth Type</label>
                     <select
                       value={form.authType}
-                      onChange={e => setForm(f => ({ ...f, authType: e.target.value as any }))}
+                      onChange={e => setForm(f => ({ ...f, authType: e.target.value as EndpointAuthType }))}
                       className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md text-xs text-text-primary px-3 py-2 focus:outline-none focus:border-accent-sky/50"
                     >
                       <option value="api_key">API Key</option>
@@ -871,16 +848,18 @@ export default function IntegrationHub() {
                   <label className="text-[10px] text-text-secondary uppercase tracking-wider mb-1 block">Endpoint URL</label>
                   <input
                     value={form.endpointUrl}
-                    onChange={e => setForm(f => ({ ...f, endpointUrl: e.target.value }))}
+                    onChange={e => { setForm(f => ({ ...f, endpointUrl: e.target.value })); setFormError(null); }}
                     className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md text-xs text-text-primary px-3 py-2 focus:outline-none focus:border-accent-sky/50"
                   />
                 </div>
+                <p className="text-[10px] leading-4 text-text-secondary">This saves connector details only. Do not paste API secrets here; live sync credentials belong in a secure server-side connector.</p>
+                {formError && <p role="alert" className="text-[10px] text-accent-red">{formError}</p>}
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="text-[10px] text-text-secondary uppercase tracking-wider mb-1 block">Auth Type</label>
                     <select
                       value={form.authType}
-                      onChange={e => setForm(f => ({ ...f, authType: e.target.value as any }))}
+                      onChange={e => setForm(f => ({ ...f, authType: e.target.value as EndpointAuthType }))}
                       className="w-full bg-white/[0.03] border border-white/[0.08] rounded-md text-xs text-text-primary px-3 py-2 focus:outline-none focus:border-accent-sky/50"
                     >
                       <option value="api_key">API Key</option>
@@ -920,7 +899,7 @@ export default function IntegrationHub() {
           </motion.div>
         )}
 
-        {/* Sync Simulator Modal */}
+        {/* Sync outcome modal */}
         {showSync && selected && (
           <motion.div
             initial={{ opacity: 0 }}
@@ -932,83 +911,31 @@ export default function IntegrationHub() {
               initial={{ scale: 0.95, y: 10 }}
               animate={{ scale: 1, y: 0 }}
               exit={{ scale: 0.95, y: 10 }}
-              className="glass-panel rounded-lg p-5 w-full max-w-md border border-white/[0.12]"
+              className="glass-panel w-full max-w-md rounded-lg border border-white/[0.12] p-5"
             >
-              <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                {!syncComplete ? <Loader2 className="h-5 w-5 animate-spin text-accent-sky" /> :
+                  syncResult === 'success' ? <CheckCircle className="h-5 w-5 text-accent-green" /> :
+                    <AlertTriangle className={`h-5 w-5 ${syncResult === 'error' ? 'text-accent-red' : 'text-accent-yellow'}`} />}
                 <div>
-                  <h3 className="text-sm font-bold text-text-primary">Syncing {selected.name}</h3>
-                  <p className="text-[10px] text-text-secondary mt-0.5">{selected.provider} · {TYPE_LABELS[selected.type]}</p>
-                </div>
-                {!syncComplete && (
-                  <button onClick={closeSync} className="p-1 rounded-md hover:bg-white/[0.06] text-text-secondary">
-                    <X className="w-4 h-4" />
-                  </button>
-                )}
-              </div>
-
-              {/* Progress Bar */}
-              <div className="mb-4">
-                <div className="w-full h-2 bg-white/[0.06] rounded-full overflow-hidden">
-                  <motion.div
-                    className="h-full bg-accent-sky rounded-full"
-                    initial={{ width: 0 }}
-                    animate={{ width: `${syncPercent}%` }}
-                    transition={{ duration: 0.2 }}
-                  />
-                </div>
-                <div className="flex items-center justify-between mt-1.5">
-                  <span className="text-[10px] text-text-secondary">{syncMessage}</span>
-                  <span className="text-[10px] text-text-secondary font-mono">{syncPercent}%</span>
+                  <h3 className="text-sm font-bold text-text-primary">{syncComplete ? 'Sync result' : `Syncing ${selected.name}`}</h3>
+                  <p className="mt-0.5 text-[10px] text-text-secondary">{selected.provider} · {TYPE_LABELS[selected.type]}</p>
                 </div>
               </div>
-
-              {/* Steps */}
-              <div className="space-y-2 mb-4">
-                {SYNC_STEPS.map((step, i) => (
-                  <div
-                    key={step.label}
-                    className={`flex items-center gap-3 p-2 rounded-md transition-colors ${
-                      i < syncStep ? 'bg-accent-green/5' : i === syncStep ? 'bg-white/[0.03]' : 'bg-transparent opacity-40'
-                    }`}
-                  >
-                    <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                      i < syncStep ? 'bg-accent-green text-void' :
-                      i === syncStep ? 'bg-accent-sky text-void' :
-                      'bg-white/10 text-text-secondary'
-                    }`}>
-                      {i < syncStep ? <CheckCircle className="w-3 h-3" /> : i + 1}
-                    </div>
-                    <div className="flex-1">
-                      <p className="text-xs text-text-primary">{step.label}</p>
-                      <p className="text-[10px] text-text-secondary">{step.detail}</p>
-                    </div>
-                    {i === syncStep && !syncComplete && (
-                      <Loader2 className="w-3.5 h-3.5 text-accent-sky animate-spin" />
-                    )}
-                  </div>
-                ))}
-              </div>
-
-              {syncComplete && (
-                <motion.div
-                  initial={{ opacity: 0, y: 5 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  className="flex items-center justify-center gap-2 p-3 bg-accent-green/10 border border-accent-green/20 rounded-md mb-4"
-                >
-                  <CheckCircle className="w-4 h-4 text-accent-green" />
-                  <span className="text-xs text-accent-green font-medium">{syncMessage}</span>
-                </motion.div>
-              )}
-
-              <div className="flex items-center justify-end">
+              <p role={syncResult === 'error' ? 'alert' : 'status'} className="mt-4 rounded-md border border-white/[0.08] bg-white/[0.03] p-3 text-xs leading-5 text-text-secondary">
+                {syncMessage}
+              </p>
+              <p className="mt-3 text-[10px] leading-5 text-text-secondary">
+                Saved connector profiles do not execute APIs. Use the Marketplace Exchange above for the secured manual provider adapters; Ozon Sheets sync is separate, and carrier labels/tracking are not live here.
+              </p>
+              <div className="mt-4 flex justify-end">
                 <button
-                  onClick={() => {
-                    closeSync();
-                    if (syncComplete) load();
-                  }}
-                  className="px-4 py-2 rounded-md bg-accent-sky text-void text-xs font-semibold hover:opacity-90 transition-all"
+                  type="button"
+                  onClick={closeSync}
+                  disabled={!syncComplete}
+                  className="rounded-md bg-accent-sky px-4 py-2 text-xs font-semibold text-void disabled:opacity-50"
                 >
-                  {syncComplete ? 'Done' : 'Abort'}
+                  {syncComplete ? 'Close' : 'Working…'}
                 </button>
               </div>
             </motion.div>
@@ -1040,13 +967,14 @@ export default function IntegrationHub() {
               </div>
 
               <div className="space-y-2 max-h-[320px] overflow-y-auto pr-1">
-                {/* Static log entries for demo */}
                 {selected.lastSync && (
                   <div className="flex items-start gap-3 p-2.5 bg-white/[0.02] rounded-md border border-white/[0.04]">
-                    <CheckCircle className="w-3.5 h-3.5 text-accent-green shrink-0 mt-0.5" />
+                    {selected.lastError
+                      ? <XCircle className="w-3.5 h-3.5 text-accent-red shrink-0 mt-0.5" />
+                      : <CheckCircle className="w-3.5 h-3.5 text-accent-green shrink-0 mt-0.5" />}
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs text-text-primary">Sync completed successfully</p>
-                      <p className="text-[10px] text-text-secondary">{selected.recordsSynced?.toLocaleString() || 0} records processed</p>
+                      <p className="text-xs text-text-primary">{selected.lastError ? 'Last sync attempt failed' : 'Last sync attempt'}</p>
+                      <p className="text-[10px] text-text-secondary">{selected.recordsSynced?.toLocaleString() || 0} total records imported or updated</p>
                     </div>
                     <span className="text-[10px] text-text-secondary font-mono shrink-0">{new Date(selected.lastSync).toLocaleTimeString()}</span>
                   </div>
@@ -1064,8 +992,8 @@ export default function IntegrationHub() {
                 <div className="flex items-start gap-3 p-2.5 bg-white/[0.02] rounded-md border border-white/[0.04]">
                   <Zap className="w-3.5 h-3.5 text-accent-yellow shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs text-text-primary">Connection established</p>
-                    <p className="text-[10px] text-text-secondary">Auth type: {parseConfig(selected.config).authType || 'api_key'}</p>
+                    <p className="text-xs text-text-primary">Saved profile — not a live connection</p>
+                    <p className="text-[10px] text-text-secondary">Auth method: {parseConfig(selected.config).authType || 'api_key'} · no secret stored</p>
                   </div>
                   <span className="text-[10px] text-text-secondary font-mono shrink-0">{new Date(selected.createdAt).toLocaleTimeString()}</span>
                 </div>

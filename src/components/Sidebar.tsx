@@ -62,6 +62,7 @@ const operationItems: NavItem[] = [
   { icon: Link2, label: 'G-Sheets', path: '/gsheet', short: 'Sheet' },
   { icon: Layers, label: 'Batch Pick', path: '/batch-pick', short: 'Batch' },
   { icon: Truck, label: 'Shipping', path: '/shipping', short: 'Ship' },
+  { icon: Plug, label: 'Marketplace Bridge', path: '/integrations', short: 'Mkt' },
 ];
 
 const advancedItems: NavItem[] = [
@@ -73,6 +74,7 @@ const advancedItems: NavItem[] = [
 
 const manualOrderItems: NavItem[] = [
   { icon: ScanBarcode, label: 'PDF Seq', path: '/pdf-sequencer', short: 'PDF' },
+  { icon: Sheet, label: 'Ozon Sheets', path: '/ozon-sheets', short: 'Ozon' },
   { icon: FileText, label: 'Templates', path: '/templates', short: 'Tpl' },
   { icon: RefreshCw, label: 'Bulk Convert', path: '/bulk-convert', short: 'Bulk' },
   { icon: Scale, label: 'Auditor', path: '/auditor', short: 'Aud' },
