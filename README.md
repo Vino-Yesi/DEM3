@@ -97,6 +97,13 @@ See `BUILD.md` for detailed platform-specific instructions.
 └── vite.config.ts                # Vite + PWA configuration
 ```
 
+## Production strategy
+
+See [docs/PRODUCTION-WMS-ROADMAP.md](docs/PRODUCTION-WMS-ROADMAP.md) for the
+executive architecture review, production security baseline, real-time event model,
+ERP/TMS/OMS boundaries, marketplace integration requirements, deployment plan, and
+measured acceptance gates.
+
 ---
 
 ## License
